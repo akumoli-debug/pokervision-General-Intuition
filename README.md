@@ -1,7 +1,7 @@
 Core idea:
 A stateful agent that builds persistent internal models of other agents
 from interaction, and conditions its decisions on those learned beliefs.
-Poker is used as a controlled testbed for repeated, adversarial interaction.
+Poker is used as a controlled testbed for repeated, adversarial interaction. This project is an exploration of agent-centric world modeling in a minimal multi-agent environment. Poker serves as a controlled setting for studying persistent entity representations, belief updates from interaction, and decision-making conditioned on learned internal models rather than equilibrium assumptions.
 
 PokerVision: Exploitative Poker AI
 ==================================
