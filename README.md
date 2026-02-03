@@ -145,6 +145,7 @@ Limitations
 - **Domain assumptions**: The current feature set and parsing logic target PokerNow-style No-Limit Hold’em logs; other formats may require custom parsing.
 - **Evaluation gap**: Offline accuracy and EV on historical data are only proxies for live win‑rate; real‑world performance will depend on table dynamics and opponent adaptation.
 - **Ethical use**: This code is for research and educational purposes; many poker sites restrict or forbid real‑time assistance tools—check and follow the rules of any platform you use.
+ - **Behavioural stationarity**: Opponent models assume behavioural stationarity over short horizons; long‑term adaptation and strategic deception are not yet modelled.
 
 Design Choices
 --------------
