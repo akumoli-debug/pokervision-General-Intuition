@@ -116,6 +116,8 @@ Results (Snapshot)
 
 Offline accuracy on held-out data from PokerNow logs:
 
+Results are included to validate the learning loop; the primary contribution is the agent architecture and belief‑update mechanism rather than absolute performance.
+
 | Model                  | Accuracy | Notes                          |
 |------------------------|----------|--------------------------------|
 | GTO-style baseline     | ~55%     | Unexploitable, not personalised |
