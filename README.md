@@ -8,10 +8,10 @@ Built as a lightweight research project to demonstrate how behavioural modelling
 Demo
 ----
 
-The repo includes a simple web UI:
+The core project lives in the `pokervision_github/` folder and includes a simple web UI:
 
 - Run the live assistant (see Quickstart below), then open `http://localhost:8000`.
-- A demo GIF (`assets/demo.gif`) in the project shows the assistant analysing hands and suggesting actions.
+- A demo GIF (`pokervision_github/assets/demo.gif`) in the project shows the assistant analysing hands and suggesting actions.
 
 Quickstart
 ----------
@@ -35,6 +35,29 @@ python scripts/train_with_cards.py
 python scripts/live_ui_fixed.py
 # Then open http://localhost:8000 in your browser
 ```
+
+Key Entry Points
+----------------
+
+Inside `pokervision_github/` the most useful scripts and docs are:
+
+- **Training**
+  - `scripts/train_pytorch.py` – basic model training.
+  - `scripts/train_enhanced_model.py` – adds richer strategic features.
+  - `scripts/train_with_cards.py` – full card-aware model used for the main results.
+  - `scripts/augment_data.py` – data augmentation via suit/position symmetry.
+  - `scripts/finetune_opponent.py` – opponent-specific fine-tuning.
+
+- **Evaluation & analysis**
+  - `scripts/compare_models_fixed.py` – compare different checkpoints.
+  - `docs/TRAINING.md` – full training instructions and tips.
+
+- **Live play / demo**
+  - `scripts/live_ui_fixed.py` – launches the browser-based assistant.
+  - `docs/API.md` – programmatic API usage examples.
+
+- **Context for General Intuition**
+  - `docs/GI_APPLICATION.md` – one-pager framing this project for General Intuition.
 
 How it Works
 ------------
