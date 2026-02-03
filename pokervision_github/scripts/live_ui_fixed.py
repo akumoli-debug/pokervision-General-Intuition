@@ -12,7 +12,7 @@ import urllib.parse
 import torch
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 import sys
 from pathlib import Path
@@ -351,11 +351,15 @@ class ScreenCaptureParser:
         if not SCREEN_CAPTURE_AVAILABLE:
             return None
         try:
+            print("[CAPTURE] about to grab screenshot", flush=True)
             with mss.mss() as sct:
                 monitor = sct.monitors[1]  # Primary monitor
                 screenshot = sct.grab(monitor)
                 img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-                return img
+            print("[CAPTURE] grabbed screenshot", flush=True)
+            img.save("debug_capture.png")
+            print("[CAPTURE] saved debug_capture.png", flush=True)
+            return img
         except Exception as e:
             print(f"Screen capture error: {e}")
             return None
@@ -783,6 +787,34 @@ class ScreenCaptureParser:
             return parsed
         except Exception as e:
             return {'error': f'OCR parsing failed: {str(e)}'}
+
+    @staticmethod
+    def _print_capture_result(result, source_label="Capture"):
+        """Print capture/upload result to terminal for visibility."""
+        try:
+            if result.get('error'):
+                print(f"[{source_label}] Error: {result['error']}")
+                return
+            print(f"\n[{source_label}]")
+            print(f"  Pot: ${result.get('pot', 0):.0f}  |  Bet: ${result.get('bet', 0):.0f}")
+            print(f"  Your stack: ${result.get('your_stack', 0):.0f}  |  Opp stack: ${result.get('opp_stack', 0):.0f}")
+            if result.get('position'):
+                print(f"  Position: {result.get('position')}  |  Street: {result.get('street', 'preflop')}")
+            if result.get('hole_cards'):
+                print(f"  Hole cards: {result.get('hole_cards')}")
+            if result.get('board_cards'):
+                print(f"  Board: {result.get('board_cards')}")
+            if result.get('players'):
+                print(f"  Players: {len(result['players'])} detected")
+                for p in result.get('players', [])[:5]:
+                    print(f"    - {p.get('name', '?')} stack=${p.get('stack', 0):.0f} {p.get('position', '')} {'[ALL-IN]' if p.get('all_in') else ''}")
+            if result.get('warnings'):
+                print(f"  Warnings: {'; '.join(result['warnings'])}")
+            if result.get('screenshot_path'):
+                print(f"  Screenshot: {result['screenshot_path']}")
+            print()
+        except Exception:
+            pass
 
     @staticmethod
     def capture_and_parse():
@@ -1284,7 +1316,7 @@ class PokerAssistant:
         # Telemetry (best-effort JSONL write, never breaks endpoint)
         # ------------------------------------------------------------------
         try:
-            ts = datetime.utcnow().isoformat() + "Z"
+            ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             # Use provided hand_id if present; otherwise generate a short UUID.
             hand_id = str(game_state.get("hand_id") or uuid.uuid4().hex[:8])
             
@@ -1848,7 +1880,7 @@ HTML = """
                 <form id="gameForm">
                     <div class="hand-description-section" style="margin-bottom: 20px;">
                         <h3>📝 Describe your hand (like ChatGPT)</h3>
-                        <p style="color: #666; font-size: 14px; margin-bottom: 10px;">Paste a hand history or describe the situation. We'll parse it and give a recommendation.</p>
+                        <p style="color: #666; font-size: 14px; margin-bottom: 10px;">Paste a hand history or describe the situation. We&#39;ll parse it and give a recommendation.</p>
                         <textarea id="hand_description" placeholder="e.g. Home game. 1/3 8k effective. Raise KTo UTG to 20. BU 3-bets to 100. I call. Flop T42r. I check. He bets 400. I call. Turn 7r. I check. He bets 850. I call. River 2. I check. He bets 2k. What do you think?" style="min-height: 140px; width: 100%; padding: 12px; border-radius: 8px; border: 2px solid #ddd; font-size: 14px;"></textarea>
                         <div style="margin-top: 10px; display: flex; gap: 10px; flex-wrap: wrap;">
                             <button type="button" class="parse-btn" onclick="analyzeFromDescription()" style="padding: 12px 24px; font-size: 16px;">🎯 Analyze & Recommend</button>
@@ -2016,8 +2048,10 @@ HTML = """
     </div>
     
     <script>
-        function switchTab(tabName, clickedBtn) {
+        function switchTab(tabId, clickedBtn) {
             try {
+                var tabName = typeof tabId === 'string' ? tabId : (tabId && tabId.id ? tabId.id.replace(/Tab$/, '') : 'manual');
+                if (!clickedBtn) clickedBtn = document.querySelector('.tab[onclick*="' + tabName + '"]');
                 console.log('[DEBUG] switchTab called:', tabName, 'clickedBtn:', !!clickedBtn);
                 // #region agent log
                 var tabEl = document.getElementById(tabName + 'Tab');
@@ -2500,16 +2534,13 @@ HTML = """
                 const cards = player.cards ? ` • Cards: ${player.cards}` : '';
                 const stackText = player.stack > 0 ? `Stack: $${player.stack}` : 'Stack: Unknown';
                 
-                // Disable selection for all-in players (you can't be all-in)
-                const disabledClass = player.all_in ? 'disabled' : '';
-                const disabledStyle = player.all_in ? 'opacity: 0.5; cursor: not-allowed;' : '';
-                const onClickAttr = player.all_in ? '' : 'onclick="selectPlayer(' + idx + ')"';
-                
-                html += '<div class="player-option ' + isSelected + ' ' + disabledClass + '" ' + onClickAttr + ' style="' + disabledStyle + '">';
+                // Allow all-in selection; warning only (handled in selectPlayer)
+                const optionalClass = player.all_in ? ' player-all-in' : '';
+                html += '<div class="player-option ' + isSelected + optionalClass + '" onclick="selectPlayer(' + idx + ')" style="' + (player.all_in ? 'opacity: 0.85;' : '') + '">';
                 html += '<div class="player-name">' + (player.name || '') + badgeText + '</div>';
                 html += '<div class="player-details">' + stackText + (cards || '') + '</div>';
                 if (player.all_in) {
-                    html += '<div style="color: #ef4444; font-size: 12px; margin-top: 5px;">⚠️ This player is all-in - you cannot be this player</div>';
+                    html += '<div style="color: #b7791f; font-size: 12px; margin-top: 5px;">⚠️ All-in — we\\'ll show outcome/info only.</div>';
                 }
                 html += '</div>';
             });
@@ -2518,34 +2549,39 @@ HTML = """
             const defaultIdx = sortedPlayers.findIndex(p => !p.all_in);
             const selectedIdx = defaultIdx >= 0 ? defaultIdx : 0;
             
-            html += '<button class="select-player-btn" type="button" onclick="confirmPlayerSelection()">Select Player</button>';
+            html += '<div id="playerSelectMessage" style="margin-top: 10px;"></div>';
+            html += '<button id="selectPlayerBtn" class="select-player-btn" type="button" disabled onclick="confirmPlayerSelection()">Select Player</button>';
             
             content.innerHTML = html;
             if (sortedPlayers.length > 0) {
                 selectedPlayerData = sortedPlayers[selectedIdx];
-                // Make sure the default is visually selected
-                document.querySelectorAll('.player-option').forEach((el, i) => {
-                    if (i === selectedIdx) {
-                        el.classList.add('selected');
-                    } else {
-                        el.classList.remove('selected');
-                    }
-                });
+                selectPlayer(selectedIdx);
             }
             modal.classList.add('active');
         }
         
-        function selectPlayer(idx) {
-            document.querySelectorAll('.player-option').forEach((el, i) => {
-                if (i === idx) {
-                    el.classList.add('selected');
-                } else {
-                    el.classList.remove('selected');
-                }
+        function selectPlayer(playerOrIdx) {
+            // Accept either player object or index (from onclick we pass index)
+            const player = typeof playerOrIdx === 'object' ? playerOrIdx : (sortedPlayersList && sortedPlayersList[playerOrIdx] ? sortedPlayersList[playerOrIdx] : null);
+            const idx = typeof playerOrIdx === 'number' ? playerOrIdx : (sortedPlayersList ? sortedPlayersList.indexOf(player) : -1);
+            window.selectedPlayer = player;
+            document.querySelectorAll('.player-option').forEach(function(el, i) {
+                if (i === idx) el.classList.add('selected');
+                else el.classList.remove('selected');
             });
-            if (sortedPlayersList && sortedPlayersList[idx]) {
-                selectedPlayerData = sortedPlayersList[idx];
+            if (player) selectedPlayerData = player;
+            var msg = document.getElementById('playerSelectMessage');
+            var btn = document.getElementById('selectPlayerBtn');
+            if (msg) {
+                if (player && (player.all_in || player.isAllIn)) {
+                    msg.textContent = "Selected player is all-in — no decision to make. We'll show outcome/info only.";
+                    msg.style.color = "#b7791f";
+                } else {
+                    msg.textContent = "";
+                    msg.style.color = "";
+                }
             }
+            if (btn) btn.disabled = false;
         }
         
         function confirmPlayerSelection() {
@@ -2700,6 +2736,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif self.path == '/api/capture':
             # Screen capture endpoint
             result = ScreenCaptureParser.capture_and_parse()
+            ScreenCaptureParser._print_capture_result(result, "Screen capture")
             
             self.send_response(200)
             self.send_header('Content-type', 'application/json; charset=utf-8')
@@ -2734,6 +2771,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get('Content-Length', '0'))
                 data = self.rfile.read(length) if length > 0 else b''
                 result = ScreenCaptureParser.parse_image_bytes(data)
+                ScreenCaptureParser._print_capture_result(result, "Upload screenshot")
                 
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json; charset=utf-8')
