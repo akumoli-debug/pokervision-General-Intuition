@@ -16,6 +16,18 @@ from datetime import datetime
 import uuid
 import sys
 from pathlib import Path
+import base64
+import io
+
+# Screen capture and OCR (optional dependencies)
+try:
+    import mss
+    import pytesseract
+    from PIL import Image
+    SCREEN_CAPTURE_AVAILABLE = True
+except ImportError:
+    SCREEN_CAPTURE_AVAILABLE = False
+    print("⚠ Screen capture not available. Install: pip install mss pytesseract pillow")
 
 # Ensure local project root is on sys.path so `belief` / `telemetry` can be imported
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -94,6 +106,115 @@ class CardParser:
         else:
             high_card = CardParser.RANK_NAMES[CardParser.RANKS[max(ranks)]]
             return {'strength': 0.20, 'description': f'High Card {high_card}'}
+
+
+class ScreenCaptureParser:
+    """Parse poker data from screen captures using OCR."""
+    
+    @staticmethod
+    def capture_screen():
+        """Capture the entire screen and return as PIL Image."""
+        if not SCREEN_CAPTURE_AVAILABLE:
+            return None
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]  # Primary monitor
+                screenshot = sct.grab(monitor)
+                img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+                return img
+        except Exception as e:
+            print(f"Screen capture error: {e}")
+            return None
+    
+    @staticmethod
+    def parse_ocr_text(text):
+        """
+        Parse OCR text to extract poker game state.
+        This is a basic parser - you may need to customize for your poker client.
+        """
+        parsed = {}
+        
+        # Try to extract pot size (look for $XX.XX patterns)
+        pot_match = re.search(r'\$(\d+\.?\d*)', text)
+        if pot_match:
+            try:
+                parsed['pot'] = float(pot_match.group(1))
+            except:
+                pass
+        
+        # Try to extract bet amount
+        bet_match = re.search(r'bet[:\s]*\$?(\d+\.?\d*)', text, re.IGNORECASE)
+        if bet_match:
+            try:
+                parsed['bet'] = float(bet_match.group(1))
+            except:
+                pass
+        
+        # Try to extract stack sizes
+        stack_match = re.search(r'stack[:\s]*\$?(\d+\.?\d*)', text, re.IGNORECASE)
+        if stack_match:
+            try:
+                parsed['your_stack'] = float(stack_match.group(1))
+            except:
+                pass
+        
+        # Try to extract cards (Ah, Kd, etc.)
+        card_pattern = r'([AKQJT2-9][hdcs])'
+        cards = re.findall(card_pattern, text, re.IGNORECASE)
+        if cards:
+            parsed['hole_cards'] = ' '.join(cards[:2])  # First 2 are hole cards
+            if len(cards) > 2:
+                parsed['board_cards'] = ' '.join(cards[2:])  # Rest are board
+        
+        # Try to extract position
+        position_map = {
+            'button': ['button', 'btn', 'dealer'],
+            'sb': ['small blind', 'sb'],
+            'bb': ['big blind', 'bb'],
+            'utg': ['utg'],
+            'hj': ['hijack', 'hj'],
+            'co': ['cutoff', 'co']
+        }
+        text_lower = text.lower()
+        for pos, keywords in position_map.items():
+            if any(kw in text_lower for kw in keywords):
+                parsed['position'] = pos
+                break
+        
+        return parsed
+    
+    @staticmethod
+    def capture_and_parse():
+        """Capture screen, run OCR, and parse poker data."""
+        if not SCREEN_CAPTURE_AVAILABLE:
+            return {'error': 'Screen capture not available. Install: pip install mss pytesseract pillow'}
+        
+        img = ScreenCaptureParser.capture_screen()
+        if img is None:
+            return {'error': 'Failed to capture screen'}
+        
+        try:
+            # Run OCR
+            ocr_text = pytesseract.image_to_string(img)
+            
+            # Parse the text
+            parsed = ScreenCaptureParser.parse_ocr_text(ocr_text)
+            
+            # Store screenshot for reference
+            screenshot_dir = Path("logs/screenshots")
+            screenshot_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            screenshot_path = screenshot_dir / f"screenshot_{timestamp}.png"
+            img.save(screenshot_path)
+            
+            parsed['screenshot_path'] = str(screenshot_path)
+            parsed['ocr_text'] = ocr_text[:500]  # First 500 chars for debugging
+            parsed['success'] = True
+            
+            return parsed
+        except Exception as e:
+            return {'error': f'OCR parsing failed: {str(e)}'}
+
 
 class PokerAssistant:
     def __init__(self):
@@ -176,10 +297,23 @@ class PokerAssistant:
         hand_eval = CardParser.evaluate_hand(hole_cards, board_cards)
         hand_strength = hand_eval['strength']
         
+        # Calculate what you've already invested based on position (blinds)
+        if position == 'sb':
+            already_invested = sb
+        elif position == 'bb':
+            already_invested = bb
+        else:
+            # Button, UTG, HJ, CO: no blind posted (unless you've acted, which we don't track here)
+            already_invested = 0.0
+        
+        # Calculate "to call" = bet amount - what you've already put in
+        to_call = max(0.0, bet - already_invested)
+        
         # Calculate metrics
         effective_stack = min(your_stack, opp_stack)
         spr = effective_stack / max(pot, 1)
-        pot_odds = bet / (pot + bet) if bet > 0 else 0
+        # Pot odds should use the actual amount to call, not the total bet
+        pot_odds = to_call / (pot + to_call) if to_call > 0 else 0
         
         # Infer coarse opponent action + context for belief updates / telemetry
         if raw_opponent_action in ("BET", "RAISE", "ALL_IN"):
@@ -296,6 +430,8 @@ class PokerAssistant:
             env_state = {
                 "pot": pot,
                 "bet": bet,
+                "to_call": to_call,
+                "already_invested": already_invested,
                 "your_stack": your_stack,
                 "opp_stack": opp_stack,
                 "small_blind": sb,
@@ -316,6 +452,7 @@ class PokerAssistant:
                 "env_state": env_state,
                 "observed_opponent_action": observed_opponent_action,
                 "pressure_context": pressure_context,
+                "action_notes": game_state.get("action_notes", ""),
                 "belief_state": {
                     "dict": belief.to_dict(),
                     "vector": belief.as_vector(),
@@ -346,6 +483,8 @@ class PokerAssistant:
             'metrics': {
                 'pot': pot,
                 'bet': bet,
+                'to_call': to_call,
+                'already_invested': already_invested,
                 'effective_stack': effective_stack,
                 'hand_strength': hand_strength
             }
@@ -560,6 +699,93 @@ HTML = """
             color: #0c5460;
         }
         
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #ddd;
+        }
+        
+        .tab {
+            padding: 12px 24px;
+            background: transparent;
+            border: none;
+            border-bottom: 3px solid transparent;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            color: #666;
+            transition: all 0.3s;
+        }
+        
+        .tab.active {
+            color: #1e3c72;
+            border-bottom-color: #1e3c72;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: inherit;
+            resize: vertical;
+            min-height: 80px;
+        }
+        
+        textarea:focus {
+            outline: none;
+            border-color: #2a5298;
+        }
+        
+        .capture-btn {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-bottom: 20px;
+            transition: transform 0.2s;
+        }
+        
+        .capture-btn:hover {
+            transform: translateY(-2px);
+        }
+        
+        .capture-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .ocr-result {
+            background: #f0f9ff;
+            border-left: 4px solid #0ea5e9;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+            font-size: 14px;
+            color: #0c4a6e;
+        }
+        
+        .ocr-result.error {
+            background: #fef2f2;
+            border-left-color: #ef4444;
+            color: #991b1b;
+        }
+        
         @media (max-width: 968px) {
             .main-grid { grid-template-columns: 1fr; }
             .input-row { grid-template-columns: 1fr; }
@@ -576,6 +802,13 @@ HTML = """
         <div class="main-grid">
             <div class="card">
                 <h2>Game State</h2>
+                
+                <div class="tabs">
+                    <button type="button" class="tab active" onclick="switchTab('manual')">Manual Input</button>
+                    <button type="button" class="tab" onclick="switchTab('capture')">Screen Capture</button>
+                </div>
+                
+                <div id="manualTab" class="tab-content active">
                 <form id="gameForm">
                     <div class="card-input-section">
                         <h3>Your Cards</h3>
@@ -667,8 +900,27 @@ HTML = """
                         <input type="text" id="opponent" placeholder="e.g., seb">
                     </div>
                     
+                    <div class="input-group">
+                        <label>Action Notes (optional)</label>
+                        <textarea id="action_notes" placeholder="Describe the action, opponent behavior, or any relevant context..."></textarea>
+                    </div>
+                    
                     <button type="submit" class="analyze-btn">🔍 Analyze & Recommend</button>
                 </form>
+                </div>
+                
+                <div id="captureTab" class="tab-content">
+                    <div class="input-group">
+                        <button type="button" class="capture-btn" id="captureBtn" onclick="captureScreen()">
+                            📸 Capture Screen & Analyze
+                        </button>
+                        <div id="ocrResult" class="ocr-result" style="display: none;"></div>
+                    </div>
+                    <p style="color: #666; font-size: 14px; margin-top: 15px;">
+                        This will capture your screen, extract poker data using OCR, and automatically analyze the hand.
+                        Make sure your poker client window is visible.
+                    </p>
+                </div>
             </div>
             
             <div class="card">
@@ -697,6 +949,71 @@ HTML = """
     </div>
     
     <script>
+        function switchTab(tabName) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(tabName + 'Tab').classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        async function captureScreen() {
+            const btn = document.getElementById('captureBtn');
+            const resultDiv = document.getElementById('ocrResult');
+            
+            btn.disabled = true;
+            btn.textContent = '📸 Capturing...';
+            resultDiv.style.display = 'none';
+            
+            try {
+                const response = await fetch('/api/capture');
+                const data = await response.json();
+                
+                if (data.error) {
+                    resultDiv.className = 'ocr-result error';
+                    resultDiv.innerHTML = `<strong>Error:</strong> ${data.error}`;
+                    resultDiv.style.display = 'block';
+                } else if (data.success) {
+                    // Fill in the form with parsed data
+                    if (data.pot) document.getElementById('pot').value = data.pot;
+                    if (data.bet) document.getElementById('bet').value = data.bet;
+                    if (data.your_stack) document.getElementById('your_stack').value = data.your_stack;
+                    if (data.position) document.getElementById('position').value = data.position;
+                    if (data.hole_cards) document.getElementById('hole_cards').value = data.hole_cards;
+                    if (data.board_cards) document.getElementById('board_cards').value = data.board_cards;
+                    
+                    resultDiv.className = 'ocr-result';
+                    resultDiv.innerHTML = `
+                        <strong>✓ Captured!</strong><br>
+                        Screenshot saved: ${data.screenshot_path}<br>
+                        <small>OCR text preview: ${data.ocr_text.substring(0, 100)}...</small>
+                    `;
+                    resultDiv.style.display = 'block';
+                    
+                    // Switch to manual tab and auto-analyze
+                    switchTab('manual');
+                    document.querySelector('.tab[onclick*="manual"]').classList.add('active');
+                    document.querySelector('.tab[onclick*="capture"]').classList.remove('active');
+                    
+                    // Auto-submit for analysis
+                    document.getElementById('gameForm').dispatchEvent(new Event('submit'));
+                }
+            } catch (error) {
+                resultDiv.className = 'ocr-result error';
+                resultDiv.innerHTML = `<strong>Error:</strong> ${error.message}`;
+                resultDiv.style.display = 'block';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '📸 Capture Screen & Analyze';
+            }
+        }
+        
         document.getElementById('gameForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             
@@ -712,7 +1029,8 @@ HTML = """
                 opponent_action: document.getElementById('opponent_action').value,
                 opponent: document.getElementById('opponent').value,
                 hole_cards: document.getElementById('hole_cards').value,
-                board_cards: document.getElementById('board_cards').value
+                board_cards: document.getElementById('board_cards').value,
+                action_notes: document.getElementById('action_notes').value
             };
             
             try {
@@ -761,7 +1079,7 @@ HTML = """
                     </div>
                     <div class="metric">
                         <div class="metric-label">To Call</div>
-                        <div class="metric-value">$${metrics.bet.toFixed(2)}</div>
+                        <div class="metric-value">$${metrics.to_call.toFixed(2)}</div>
                     </div>
                     <div class="metric">
                         <div class="metric-label">Pot Odds</div>
@@ -826,6 +1144,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             
             game_state = {k: v[0] for k, v in params.items()}
             result = assistant.analyze(game_state)
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode('utf-8'))
+        
+        elif self.path == '/api/capture':
+            # Screen capture endpoint
+            result = ScreenCaptureParser.capture_and_parse()
             
             self.send_response(200)
             self.send_header('Content-type', 'application/json; charset=utf-8')
