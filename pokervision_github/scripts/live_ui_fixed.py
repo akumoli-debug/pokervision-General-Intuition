@@ -12,6 +12,18 @@ import urllib.parse
 import torch
 import os
 import re
+from datetime import datetime
+import uuid
+import sys
+from pathlib import Path
+
+# Ensure local project root is on sys.path so `belief` / `telemetry` can be imported
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
+from belief.opponent_belief import OpponentBelief  # type: ignore
+from telemetry.logger import log_event  # type: ignore
 
 # Load model
 MODEL_PATH = 'models/final_model.pt'
@@ -99,6 +111,23 @@ class PokerAssistant:
         except Exception as e:
             print(f"✗ Error: {e}")
             self.opponent_models = {}
+        
+        # Persistent belief state per opponent (updated across hands)
+        self.belief_by_player = {}  # name -> OpponentBelief
+        # Where to write JSONL telemetry events (best‑effort only)
+        self.telemetry_path = "logs/telemetry.jsonl"
+    
+    def get_belief(self, name):
+        """Get or create the persistent belief state for an opponent."""
+        key = (name or "").strip().lower()
+        if not key:
+            # Anonymous / unknown opponent: use a shared default instance
+            key = "_anonymous"
+        belief = self.belief_by_player.get(key)
+        if belief is None:
+            belief = OpponentBelief()
+            self.belief_by_player[key] = belief
+        return belief
     
     def get_opponent_info(self, name):
         name = name.lower().strip()
@@ -119,9 +148,11 @@ class PokerAssistant:
         bet = float(game_state.get('bet', 0))
         your_stack = float(game_state.get('your_stack', 100))
         opp_stack = float(game_state.get('opp_stack', 100))
+        sb = float(game_state.get('small_blind', 0.5))
         bb = float(game_state.get('big_blind', 1))
         position = game_state.get('position', 'bb')
         opponent_name = game_state.get('opponent', '')
+        raw_opponent_action = (game_state.get('opponent_action') or '').strip().upper()
         
         # Parse cards
         hole_str = game_state.get('hole_cards', '')
@@ -150,8 +181,32 @@ class PokerAssistant:
         spr = effective_stack / max(pot, 1)
         pot_odds = bet / (pot + bet) if bet > 0 else 0
         
+        # Infer coarse opponent action + context for belief updates / telemetry
+        if raw_opponent_action in ("BET", "RAISE", "ALL_IN"):
+            observed_opponent_action = "PRESSURE"
+        elif raw_opponent_action in ("CHECK", "CALL", "FOLD"):
+            observed_opponent_action = "NO_BET"
+        else:
+            # Fallback: infer from bet size if action not specified
+            if bet and bet > 0:
+                observed_opponent_action = "PRESSURE"
+            else:
+                observed_opponent_action = "NO_BET"
+        
+        # Simple pressure context bucketed by SPR and position
+        if spr < 3:
+            spr_bucket = "low_spr"
+        elif spr > 10:
+            spr_bucket = "high_spr"
+        else:
+            spr_bucket = "mid_spr"
+        pressure_context = f"{spr_bucket}_{position}"
+        
         # Get opponent
         opp_info = self.get_opponent_info(opponent_name) if opponent_name else {'known': False}
+        # Persistent belief state for this opponent (updated online)
+        belief = self.get_belief(opponent_name)
+        belief.hands_seen += 1
         
         # Make recommendation based on hand strength + situation
         if bet == 0:
@@ -203,6 +258,82 @@ class PokerAssistant:
             elif opp_info['fold_freq'] < 0.30 and action == 'RAISE' and hand_strength < 0.7:
                 reasoning += ' | WARNING: Calling station - need strong value'
         
+        # ------------------------------------------------------------------
+        # Online belief updates (kept tiny and stable)
+        # ------------------------------------------------------------------
+
+        # Update aggression estimate based on whether we faced pressure
+        if observed_opponent_action == "PRESSURE":
+            # Move aggression toward 1.0 with a decaying learning rate
+            lr = 1.0 / float(belief.aggro_n + 1)
+            target = 1.0
+            new_aggr = belief.aggression + lr * (target - belief.aggression)
+            belief.aggression = max(0.0, min(1.0, new_aggr))
+            belief.aggro_n += 1
+        elif observed_opponent_action == "NO_BET" and belief.aggro_n > 0:
+            # Slightly nudge aggression down when opponents decline to apply pressure
+            lr = 1.0 / float(belief.aggro_n + 1)
+            target = 0.3
+            new_aggr = belief.aggression + lr * (target - belief.aggression)
+            belief.aggression = max(0.0, min(1.0, new_aggr))
+
+        # When we choose a pressure action, nudge fold_to_pressure toward prior fold_freq
+        if action in ("BET", "RAISE") and opp_info.get('known') and 'fold_freq' in opp_info:
+            prior_fold = float(opp_info['fold_freq'])
+            lr = 0.1 / float(belief.fold_n + 1)  # very conservative update
+            new_fold = belief.fold_to_pressure + lr * (prior_fold - belief.fold_to_pressure)
+            belief.fold_to_pressure = max(0.0, min(1.0, new_fold))
+            belief.fold_n += 1
+
+        # ------------------------------------------------------------------
+        # Telemetry (best-effort JSONL write, never breaks endpoint)
+        # ------------------------------------------------------------------
+        try:
+            ts = datetime.utcnow().isoformat() + "Z"
+            # Use provided hand_id if present; otherwise generate a short UUID.
+            hand_id = str(game_state.get("hand_id") or uuid.uuid4().hex[:8])
+
+            env_state = {
+                "pot": pot,
+                "bet": bet,
+                "your_stack": your_stack,
+                "opp_stack": opp_stack,
+                "small_blind": sb,
+                "big_blind": bb,
+                "position": position,
+                "street": game_state.get("street"),
+                "raw_opponent_action": raw_opponent_action,
+                "spr": spr,
+                "pot_odds": pot_odds,
+                "has_hole_cards": bool(hole_str),
+                "board_cards_count": len(board_cards),
+            }
+
+            event = {
+                "ts": ts,
+                "hand_id": hand_id,
+                "opponent": opponent_name,
+                "env_state": env_state,
+                "observed_opponent_action": observed_opponent_action,
+                "pressure_context": pressure_context,
+                "belief_state": {
+                    "dict": belief.to_dict(),
+                    "vector": belief.as_vector(),
+                },
+                "opp_info_prior": opp_info,
+                "recommendation": {
+                    "action": action,
+                    "bet_size": bet_size,
+                    "confidence": self.accuracy,
+                    "reasoning": reasoning,
+                },
+            }
+
+            log_event(self.telemetry_path, event)
+        except Exception:
+            # Telemetry is strictly best-effort.
+            pass
+
         return {
             'action': action,
             'bet_size': bet_size,
@@ -484,15 +615,49 @@ HTML = """
                     
                     <div class="input-row">
                         <div class="input-group">
+                            <label>Small Blind ($)</label>
+                            <input type="number" id="small_blind" step="0.01" placeholder="1.00" required>
+                        </div>
+                        <div class="input-group">
                             <label>Big Blind ($)</label>
                             <input type="number" id="big_blind" step="0.01" placeholder="2.00" required>
                         </div>
+                    </div>
+                    
+                    <div class="input-row">
                         <div class="input-group">
                             <label>Position</label>
                             <select id="position">
-                                <option value="button">Button</option>
-                                <option value="bb">Big Blind</option>
-                                <option value="sb">Small Blind</option>
+                                <option value="button">Button (BTN)</option>
+                                <option value="sb">Small Blind (SB)</option>
+                                <option value="bb">Big Blind (BB)</option>
+                                <option value="utg">UTG</option>
+                                <option value="hj">Hijack (HJ)</option>
+                                <option value="co">Cutoff (CO)</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div class="input-row">
+                        <div class="input-group">
+                            <label>Street</label>
+                            <select id="street">
+                                <option value="preflop">Preflop</option>
+                                <option value="flop">Flop</option>
+                                <option value="turn">Turn</option>
+                                <option value="river">River</option>
+                            </select>
+                        </div>
+                        <div class="input-group">
+                            <label>Opponent Action (this decision)</label>
+                            <select id="opponent_action">
+                                <option value="">-- Select --</option>
+                                <option value="CHECK">Check</option>
+                                <option value="BET">Bet</option>
+                                <option value="RAISE">Raise</option>
+                                <option value="CALL">Call</option>
+                                <option value="FOLD">Fold</option>
+                                <option value="ALL_IN">All-in</option>
                             </select>
                         </div>
                     </div>
@@ -540,8 +705,11 @@ HTML = """
                 bet: document.getElementById('bet').value,
                 your_stack: document.getElementById('your_stack').value,
                 opp_stack: document.getElementById('opp_stack').value,
+                small_blind: document.getElementById('small_blind').value,
                 big_blind: document.getElementById('big_blind').value,
+                street: document.getElementById('street').value,
                 position: document.getElementById('position').value,
+                opponent_action: document.getElementById('opponent_action').value,
                 opponent: document.getElementById('opponent').value,
                 hole_cards: document.getElementById('hole_cards').value,
                 board_cards: document.getElementById('board_cards').value
