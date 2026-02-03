@@ -21,7 +21,9 @@ The core project lives in the `pokervision_github/` folder and includes a simple
 Architecture
 ------------
 
-![PokerVision architecture](assets/architecture.png)
+<p align="center">
+  <img src="assets/architecture.png" alt="PokerVision architecture" width="420">
+</p>
 
 High-level flow:
 
