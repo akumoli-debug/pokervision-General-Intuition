@@ -7,6 +7,8 @@ PokerVision: Exploitative Poker AI
 ==================================
 PokerVision is a stateful agent operating in a multi-agent environment that learns persistent, opponent-specific behavioral models from interaction logs. Rather than optimizing for equilibrium play, it infers how other agents deviate from idealized assumptions and conditions its decisions on those learned internal models. Poker is used as a controlled testbed for studying behavioral world modeling under uncertainty.
 
+Rather than relying on larger models or more data, the project focuses on explicit internal state, online belief updates, and interaction-driven learning.
+
 A stateful agent that builds internal models of other agents and conditions decisions on them.
 Built as a lightweight research project to demonstrate how behavioural modelling can outperform static “play-perfect” solvers against real, non‑optimal opponents.
 
@@ -16,6 +18,7 @@ Demo
 The core project lives in the `pokervision_github/` folder and includes a simple web UI:
 
 - Run the live assistant (see Quickstart below), then open `http://localhost:8000`.
+- The UI returns **Action**, **Bet size**, **Reasoning**, and **Advice** for each analysis.
 - A demo GIF (`pokervision_github/assets/demo.gif`) in the project shows the assistant analysing hands and suggesting actions.
 
 Architecture
@@ -36,6 +39,11 @@ High-level flow:
 - **Action recommendation** (bet / call / fold, with explanation)  
   ↓  
 - **Observed opponent action** → **belief update loop** back into the opponent state
+
+Advice + Belief (Live)
+----------------------
+
+Advice in the live UI is generated from the current hand context (pot odds, hand strength, pressure) and a **persistent per-opponent belief** updated online after each interaction. That internal state—how often this opponent applies pressure vs checks—drives both the recommendation and the advice text (e.g. “Opponent shows frequent pressure in similar spots”). So decisions and explanations are conditioned on the same belief state.
 
 Why Poker?
 ----------
@@ -62,7 +70,7 @@ python scripts/train_with_cards.py
 
 # 5. Launch the live assistant UI
 python scripts/live_ui_fixed.py
-# Then open http://localhost:8000 in your browser
+# Then open http://localhost:8000 — the UI returns Action, Bet size, Reasoning, and Advice per hand.
 ```
 
 Key Entry Points
@@ -104,7 +112,17 @@ PokerVision maintains an internal **belief state** over other agents and updates
 3. **Policy conditioning (how it decides)**  
    At decision time, the policy conditions jointly on the current environment state and the opponent belief state. The belief modulates action preferences—for example, applying more pressure to inferred over-folders or favouring thin value bets versus calling stations—so behaviour adapts to specific opponents instead of playing a static equilibrium strategy.
 
-In short:
+In short (explicit abstraction):
+
+```text
+belief ← prior
+for each interaction:
+    observe action
+    belief ← update(belief, action)
+    act ← policy(state, belief)
+```
+
+Data flow:
 
 ```text
 Hand state + opponent stats
@@ -148,6 +166,13 @@ Limitations
 - **Evaluation gap**: Offline accuracy and EV on historical data are only proxies for live win‑rate; real‑world performance will depend on table dynamics and opponent adaptation.
 - **Ethical use**: This code is for research and educational purposes; many poker sites restrict or forbid real‑time assistance tools—check and follow the rules of any platform you use.
  - **Behavioural stationarity**: Opponent models assume behavioural stationarity over short horizons; long‑term adaptation and strategic deception are not yet modelled.
+
+Failure Modes & Open Questions
+------------------------------
+
+- Belief updates assume short-term behavioral stationarity; adversarial deception is not modeled.
+- Sparse interaction leads to overconfident beliefs without strong priors.
+- Offline evaluation may overestimate gains due to non-stationary opponent adaptation.
 
 Design Choices
 --------------

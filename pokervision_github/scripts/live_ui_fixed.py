@@ -881,6 +881,8 @@ class PokerAssistant:
         
         # Persistent belief state per opponent (updated across hands)
         self.belief_by_player = {}  # name -> OpponentBelief
+        # Lightweight advice belief per opponent: hands_seen, pressure_freq, passive_freq (dict)
+        self.advice_belief_by_player = {}
         # Current hand history tracking (hand_id -> HandHistory)
         self.current_hand_histories = {}  # hand_id -> HandHistory
         # Where to write JSONL telemetry events (best‑effort only)
@@ -897,8 +899,16 @@ class PokerAssistant:
             belief = OpponentBelief()
             self.belief_by_player[key] = belief
         return belief
+
+    def _get_advice_belief(self, name):
+        """Get or create lightweight advice belief: hands_seen, pressure_freq, passive_freq (all in [0,1] where applicable)."""
+        key = (name or "").strip().lower() or "_anonymous"
+        if key not in self.advice_belief_by_player:
+            self.advice_belief_by_player[key] = {'hands_seen': 0, 'pressure_freq': 0.5, 'passive_freq': 0.5}
+        return self.advice_belief_by_player[key]
     
-    def get_opponent_info(self, name):
+    def get_opponent_belief(self, name):
+        """Return prior opponent_belief (stats) from known models; else unknown."""
         name = name.lower().strip()
         if name in self.opponent_models:
             opp = self.opponent_models[name]
@@ -1055,11 +1065,27 @@ class PokerAssistant:
             spr_bucket = "mid_spr"
         pressure_context = f"{spr_bucket}_{position}"
         
-        # Get opponent
-        opp_info = self.get_opponent_info(opponent_name) if opponent_name else {'known': False}
+        # Get opponent (prior belief from known models)
+        opponent_belief = self.get_opponent_belief(opponent_name) if opponent_name else {'known': False}
         # Persistent belief state for this opponent (updated online)
         belief = self.get_belief(opponent_name)
         belief.hands_seen += 1
+
+        # Lightweight advice belief: infer observed action and update online (confidence-weighted lr = 1/(n+1))
+        observed_advice = "PRESSURE" if bet > 0 else "NO_BET"
+        ab = self._get_advice_belief(opponent_name)
+        n_ab = ab['hands_seen']
+        lr = 1.0 / (n_ab + 1)
+        ab['hands_seen'] = n_ab + 1
+        pf = ab.get('pressure_freq', 0.5)
+        if observed_advice == "PRESSURE":
+            ab['pressure_freq'] = max(0, min(1, pf + lr * (1 - pf)))
+        else:
+            ab['pressure_freq'] = max(0, min(1, pf + lr * (0 - pf)))
+        ab['passive_freq'] = 1.0 - ab['pressure_freq']
+        h_seen = ab['hands_seen']
+        pressure_freq_ab = ab['pressure_freq']
+        passive_freq_ab = ab['passive_freq']
         
         # Predict opponent's likely action based on action history
         opponent_action_probs = belief.predict_action(street, all_previous_actions)
@@ -1176,9 +1202,9 @@ class PokerAssistant:
                     bet_size = f'${bet:.2f}'
             else:
                 # Consider opponent tendencies and action history
-                if not is_all_in and opp_info.get('known') and opp_info['fold_freq'] > 0.60:
+                if not is_all_in and opponent_belief.get('known') and opponent_belief['fold_freq'] > 0.60:
                     action = 'RAISE'
-                    reasoning = f'Bluff opportunity - opponent folds {opp_info["fold_freq"]:.1%}'
+                    reasoning = f'Bluff opportunity - opponent folds {opponent_belief["fold_freq"]:.1%}'
                     if pattern_insights:
                         reasoning += ' | ' + '; '.join(pattern_insights)
                     bet_size = f'${bet * 3:.2f} (3x raise)'
@@ -1201,10 +1227,10 @@ class PokerAssistant:
                     bet_size = 'N/A'
         
         # Adjust for opponent
-        if opp_info.get('known'):
-            if opp_info['aggression'] > 2.5 and action == 'CALL' and hand_strength > 0.6:
+        if opponent_belief.get('known'):
+            if opponent_belief['aggression'] > 2.5 and action == 'CALL' and hand_strength > 0.6:
                 reasoning += ' | Consider check-raise vs aggressive opponent'
-            elif opp_info['fold_freq'] < 0.30 and action == 'RAISE' and hand_strength < 0.7:
+            elif opponent_belief['fold_freq'] < 0.30 and action == 'RAISE' and hand_strength < 0.7:
                 reasoning += ' | WARNING: Calling station - need strong value'
         
         # ------------------------------------------------------------------
@@ -1227,8 +1253,8 @@ class PokerAssistant:
             belief.aggression = max(0.0, min(1.0, new_aggr))
 
         # When we choose a pressure action, nudge fold_to_pressure toward prior fold_freq
-        if action in ("BET", "RAISE") and opp_info.get('known') and 'fold_freq' in opp_info:
-            prior_fold = float(opp_info['fold_freq'])
+        if action in ("BET", "RAISE") and opponent_belief.get('known') and 'fold_freq' in opponent_belief:
+            prior_fold = float(opponent_belief['fold_freq'])
             lr = 0.1 / float(belief.fold_n + 1)  # very conservative update
             new_fold = belief.fold_to_pressure + lr * (prior_fold - belief.fold_to_pressure)
             belief.fold_to_pressure = max(0.0, min(1.0, new_fold))
@@ -1301,7 +1327,7 @@ class PokerAssistant:
                     "dict": belief.to_dict(),
                     "vector": belief.as_vector(),
                 },
-                "opp_info_prior": opp_info,
+                "opponent_belief_prior": opponent_belief,
                 "recommendation": {
                     "action": action,
                     "bet_size": bet_size,
@@ -1315,15 +1341,52 @@ class PokerAssistant:
             # Telemetry is strictly best-effort.
             pass
 
+        # Human-readable advice (1-2 sentences); never crash
+        try:
+            parts = []
+            if bet > 0:
+                parts.append("You are facing pressure (a bet).")
+            if h_seen >= 3:
+                if pressure_freq_ab >= 0.6:
+                    parts.append("Opponent shows frequent pressure in similar spots.")
+                elif pressure_freq_ab <= 0.35:
+                    parts.append("Opponent rarely applies pressure.")
+            if opponent_belief.get('known'):
+                ff = opponent_belief.get('fold_freq', 0.5)
+                ag = opponent_belief.get('aggression', 1.0)
+                if ff > 0.55:
+                    parts.append("Belief about opponent: they fold to pressure often.")
+                elif ff < 0.35:
+                    parts.append("Belief about opponent: they call down frequently.")
+                if ag > 2.0:
+                    parts.append("They apply aggression often.")
+            if prediction_confidence < 0.4 and bet > 0:
+                parts.append("Uncertainty is high; pot odds and hand strength are the main guide.")
+            if not parts:
+                if pot_odds > 0 and hand_strength > 0:
+                    if hand_strength >= pot_odds:
+                        parts.append("Pot odds are acceptable given your hand strength.")
+                    else:
+                        parts.append("Pot odds are tight relative to hand strength.")
+                else:
+                    parts.append("Consider pot odds and hand strength.")
+            advice = " ".join(parts)[:280].strip() or "Consider pot odds and your hand."
+        except Exception:
+            advice = "Pot odds and hand strength suggest " + action + "."
+
+        belief_state = {'hands_seen': h_seen, 'pressure_freq': round(pressure_freq_ab, 2), 'passive_freq': round(passive_freq_ab, 2)}
+
         return {
             'action': action,
             'bet_size': bet_size,
             'confidence': self.accuracy,
             'reasoning': reasoning,
+            'advice': advice,
             'hand_evaluation': hand_eval,
             'pot_odds': pot_odds,
             'spr': spr,
-            'opponent_info': opp_info,
+            'opponent_belief': opponent_belief,
+            'belief_state': belief_state,
             'env_state': {
                 'action_history': action_history_serialized,
                 'action_pattern': action_pattern,
@@ -2019,7 +2082,7 @@ HTML = """
                 var card = document.createElement('div');
                 card.className = 'card';
                 card.style.marginTop = '12px';
-                card.innerHTML = '<div class="recommendation"><div class="rec-action">' + result.action + '</div><div class="rec-bet-size">' + (result.bet_size || '') + '</div><div class="rec-reasoning">' + (result.reasoning || '') + '</div></div>';
+                card.innerHTML = '<div class="recommendation"><div class="rec-action">' + result.action + '</div><div class="rec-bet-size">' + (result.bet_size || '') + '</div><div class="rec-reasoning">' + (result.reasoning || '') + '</div>' + (result.advice ? '<div class="rec-advice" style="margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.3);font-size:15px;"><strong>Advice:</strong> ' + result.advice + '</div>' : '') + '</div>';
                 if (result._parsed && result._parsed.hole_cards) {
                     card.innerHTML += '<p style="margin: 10px 0; font-size: 14px;"><strong>Parsed:</strong> ' + result._parsed.hole_cards + ' on ' + (result._parsed.board_cards || '') + ' | Pot $' + (result._parsed.pot || 0) + ', Bet $' + (result._parsed.bet || 0) + ' | ' + (result._parsed.street || '') + '</p>';
                 }
@@ -2268,7 +2331,7 @@ HTML = """
         
         function displayResult(result) {
             const metrics = result.metrics;
-            const opp = result.opponent_info;
+            const opp = result.opponent_belief;
             const hand = result.hand_evaluation;
             
             let html = `
@@ -2277,6 +2340,7 @@ HTML = """
                         <div class="rec-action">🎯 ${result.action}</div>
                         <div class="rec-bet-size">${result.bet_size}</div>
                         <div class="rec-reasoning">${result.reasoning}</div>
+                        ${result.advice ? '<div class="rec-advice" style="margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.3);font-size:15px;"><strong>Advice:</strong> ' + result.advice + '</div>' : ''}
                     </div>
             `;
             
