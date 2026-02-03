@@ -320,6 +320,16 @@ class HandDescriptionParser:
             action_history.append({'street': 'river', 'action': 'BET', 'bet_size': last_bet, 'pot_size': parsed.get('pot', 0)})
         parsed['action_history'] = action_history
         
+        # Detect explicit action intent: user is describing a shove/jam they made or propose
+        shove_phrases = [
+            'i shove', 'i jam', 'i move all in', 'i go all in', 'i push',
+            'move in for', 'all in for', 'i check-raise all in', 'check-raise all in',
+        ]
+        for phrase in shove_phrases:
+            if phrase in text_lower:
+                parsed['proposed_action'] = 'SHOVE'
+                break
+        
         parsed['raw_description'] = text
         parsed['success'] = True
         return parsed
@@ -971,6 +981,7 @@ class PokerAssistant:
         street = game_state.get('street', 'preflop').lower()
         opponent_name = game_state.get('opponent', '')
         raw_opponent_action = (game_state.get('opponent_action') or '').strip().upper()
+        proposed_action = (game_state.get('proposed_action') or '').strip().upper()
         
         # Parse cards
         hole_str = game_state.get('hole_cards', '')
@@ -1118,6 +1129,68 @@ class PokerAssistant:
         h_seen = ab['hands_seen']
         pressure_freq_ab = ab['pressure_freq']
         passive_freq_ab = ab['passive_freq']
+        
+        # ------------------------------------------------------------------
+        # River shove evaluation: user described a shove (e.g. "I move all in")
+        # Evaluate it instead of recommending call/fold; compare fold equity vs opponent tendency.
+        # ------------------------------------------------------------------
+        if proposed_action == 'SHOVE' and street == 'river':
+            # Required fold equity: break-even fold % if we have 0 equity when called (conservative)
+            pot_after_shove = pot + your_stack
+            req_fold_equity = your_stack / pot_after_shove if pot_after_shove > 0 else 0.5
+            # With some equity when called we need less fold frequency; reduce requirement slightly
+            req_fold_equity = max(0.0, req_fold_equity - hand_strength * 0.15)
+            # Estimated opponent fold frequency: from belief or prior
+            est_fold_freq = belief.fold_to_pressure if (belief.fold_n > 0) else (opponent_belief.get('fold_freq', 0.5) if opponent_belief.get('known') else 0.5)
+            good_shove = est_fold_freq >= req_fold_equity * 0.85  # small margin
+            verdict = 'GOOD SHOVE' if good_shove else 'BAD SHOVE'
+            reasoning_parts = [
+                f'Required fold equity: {req_fold_equity:.0%} (shove risk vs pot).',
+                f'Estimated opponent folds: {est_fold_freq:.0%}.',
+            ]
+            if opponent_belief.get('known'):
+                reasoning_parts.append(f'Opponent tendency (fold to pressure): {opponent_belief.get("fold_freq", 0.5):.0%}.')
+            reasoning_parts.append(f'Hand: {hand_eval["description"]} (strength {hand_strength:.0%}) — {"enough" if hand_strength > 0.3 else "little"} equity when called.')
+            reasoning = ' '.join(reasoning_parts)
+            advice = f'This is an evaluation of your shove, not a recommendation. {verdict}: {reasoning[:200]}.'
+            action_history_serialized = []
+            for s in ['preflop', 'flop', 'turn', 'river']:
+                for action_obj in hand_history.get_street_actions(s):
+                    action_history_serialized.append({
+                        'street': action_obj.street,
+                        'action': action_obj.action,
+                        'bet_size': action_obj.bet_size,
+                        'pot_size': action_obj.pot_size,
+                        'position': action_obj.position
+                    })
+            return {
+                'action': 'EVALUATE_SHOVE',
+                'verdict': verdict,
+                'bet_size': 'N/A',
+                'confidence': self.accuracy,
+                'reasoning': reasoning,
+                'advice': advice,
+                'hand_evaluation': hand_eval,
+                'pot_odds': pot_odds,
+                'spr': spr,
+                'opponent_belief': opponent_belief,
+                'belief_state': {'hands_seen': h_seen, 'pressure_freq': round(pressure_freq_ab, 2), 'passive_freq': round(passive_freq_ab, 2)},
+                'env_state': {
+                    'action_history': action_history_serialized,
+                    'action_pattern': {},
+                    'predicted_opponent_action': None,
+                    'prediction_confidence': 0,
+                    'aggression_level': 0,
+                },
+                'metrics': {
+                    'pot': pot,
+                    'bet': bet,
+                    'to_call': to_call,
+                    'already_invested': already_invested,
+                    'effective_stack': effective_stack,
+                    'hand_strength': hand_strength
+                }
+            }
         
         # Predict opponent's likely action based on action history
         opponent_action_probs = belief.predict_action(street, all_previous_actions)
@@ -2108,6 +2181,7 @@ HTML = """
                 // #region agent log
                 fetch('http://127.0.0.1:7243/ingest/b4103c64-22ce-4509-985b-06f21511cca0',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'analyzeFromDescription',message:'after fetch',data:{ok:response.ok,status:response.status,hasError:!!result.error,hasAction:!!result.action},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H3'})}).catch(function(){});
                 // #endregion
+                // On error (e.g. 400 parse failure): show message only, do not render action card or call displayResult
                 if (result.error) {
                     resultDiv.innerHTML = '<div class="ocr-result error"><strong>Error:</strong> ' + result.error + '</div>';
                     return;
@@ -2116,7 +2190,15 @@ HTML = """
                 var card = document.createElement('div');
                 card.className = 'card';
                 card.style.marginTop = '12px';
-                card.innerHTML = '<div class="recommendation"><div class="rec-action">' + result.action + '</div><div class="rec-bet-size">' + (result.bet_size || '') + '</div><div class="rec-reasoning">' + (result.reasoning || '') + '</div>' + (result.advice ? '<div class="rec-advice" style="margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.3);font-size:15px;"><strong>Advice:</strong> ' + result.advice + '</div>' : '') + '</div>';
+                var isShoveEvalDesc = result.action === 'EVALUATE_SHOVE';
+                var recHtmlDesc = '<div class="recommendation">';
+                if (isShoveEvalDesc) {
+                    recHtmlDesc += '<div class="rec-action" style="font-size:14px; opacity:0.95;">📋 Evaluating your shove (not a recommendation)</div><div class="rec-action" style="margin-top:8px;">' + (result.verdict || result.action) + '</div>';
+                } else {
+                    recHtmlDesc += '<div class="rec-action">' + result.action + '</div><div class="rec-bet-size">' + (result.bet_size || '') + '</div>';
+                }
+                recHtmlDesc += '<div class="rec-reasoning">' + (result.reasoning || '') + '</div>' + (result.advice ? '<div class="rec-advice" style="margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.3);font-size:15px;"><strong>Advice:</strong> ' + result.advice + '</div>' : '') + '</div>';
+                card.innerHTML = recHtmlDesc;
                 if (result._parsed && result._parsed.hole_cards) {
                     card.innerHTML += '<p style="margin: 10px 0; font-size: 14px;"><strong>Parsed:</strong> ' + result._parsed.hole_cards + ' on ' + (result._parsed.board_cards || '') + ' | Pot $' + (result._parsed.pot || 0) + ', Bet $' + (result._parsed.bet || 0) + ' | ' + (result._parsed.street || '') + '</p>';
                 }
@@ -2336,6 +2418,7 @@ HTML = """
             
             const gameState = {
                 hand_id: handId,
+                hand_description: document.getElementById('hand_description').value.trim(),
                 pot: document.getElementById('pot').value,
                 bet: document.getElementById('bet').value,
                 your_stack: document.getElementById('your_stack').value,
@@ -2357,6 +2440,12 @@ HTML = """
             try {
                 const response = await fetch('/api/analyze?' + new URLSearchParams(gameState));
                 const result = await response.json();
+                if (result.error) {
+                    document.getElementById('result').innerHTML = '<div class="card" style="border-color: #dc2626;"><div class="ocr-result error" style="padding: 16px;"><strong>Error:</strong> ' + result.error + '</div></div>';
+                    document.getElementById('result').style.display = 'block';
+                    document.getElementById('result').scrollIntoView({ behavior: 'smooth' });
+                    return;
+                }
                 displayResult(result);
             } catch (error) {
                 alert('Error: ' + error);
@@ -2367,12 +2456,13 @@ HTML = """
             const metrics = result.metrics;
             const opp = result.opponent_belief;
             const hand = result.hand_evaluation;
+            const isShoveEval = result.action === 'EVALUATE_SHOVE';
             
             let html = `
                 <div class="card">
                     <div class="recommendation">
-                        <div class="rec-action">🎯 ${result.action}</div>
-                        <div class="rec-bet-size">${result.bet_size}</div>
+                        ${isShoveEval ? '<div class="rec-action" style="font-size:14px; opacity:0.95;">📋 Evaluating your shove (not a recommendation)</div><div class="rec-action" style="margin-top:8px;">' + (result.verdict || result.action) + '</div>' : '<div class="rec-action">🎯 ' + result.action + '</div>'}
+                        ${!isShoveEval ? '<div class="rec-bet-size">' + result.bet_size + '</div>' : ''}
                         <div class="rec-reasoning">${result.reasoning}</div>
                         ${result.advice ? '<div class="rec-advice" style="margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.3);font-size:15px;"><strong>Advice:</strong> ' + result.advice + '</div>' : ''}
                     </div>
@@ -2692,28 +2782,40 @@ class RequestHandler(BaseHTTPRequestHandler):
             # #endregion
             if not text:
                 result = {'error': 'No description text provided'}
-            else:
-                parsed = HandDescriptionParser.parse_hand_description(text)
-                if not parsed.get('success'):
-                    result = {'error': 'Could not parse hand description'}
-                else:
-                    game_state = {
-                        'pot': parsed.get('pot', 0),
-                        'bet': parsed.get('bet', 0),
-                        'your_stack': parsed.get('your_stack', 8000),
-                        'opp_stack': parsed.get('opp_stack', 8000),
-                        'small_blind': parsed.get('small_blind', 1),
-                        'big_blind': parsed.get('big_blind', 3),
-                        'street': parsed.get('street', 'river'),
-                        'position': parsed.get('position', 'utg'),
-                        'opponent_action': parsed.get('opponent_action', 'BET'),
-                        'opponent': parsed.get('opponent', ''),
-                        'hole_cards': parsed.get('hole_cards', ''),
-                        'board_cards': parsed.get('board_cards', ''),
-                        'action_history': json.dumps(parsed.get('action_history', [])),
-                    }
-                    result = assistant.analyze(game_state)
-                    result['_parsed'] = {k: v for k, v in parsed.items() if k != 'raw_description'}
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+                return
+            parsed = HandDescriptionParser.parse_hand_description(text)
+            # Guard: free-text provided but parsing failed — return 400, do not call assistant.analyze
+            if not parsed.get('success'):
+                result = {
+                    'error': 'Could not parse hand description. Include stakes (e.g. 1/3), pot/bet amounts, your cards, and street (flop/turn/river).'
+                }
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+                return
+            game_state = {
+                'pot': parsed.get('pot', 0),
+                'bet': parsed.get('bet', 0),
+                'your_stack': parsed.get('your_stack', 8000),
+                'opp_stack': parsed.get('opp_stack', 8000),
+                'small_blind': parsed.get('small_blind', 1),
+                'big_blind': parsed.get('big_blind', 3),
+                'street': parsed.get('street', 'river'),
+                'position': parsed.get('position', 'utg'),
+                'opponent_action': parsed.get('opponent_action', 'BET'),
+                'opponent': parsed.get('opponent', ''),
+                'hole_cards': parsed.get('hole_cards', ''),
+                'board_cards': parsed.get('board_cards', ''),
+                'action_history': json.dumps(parsed.get('action_history', [])),
+                'proposed_action': parsed.get('proposed_action'),
+            }
+            result = assistant.analyze(game_state)
+            result['_parsed'] = {k: v for k, v in parsed.items() if k != 'raw_description'}
             self.send_response(200)
             self.send_header('Content-type', 'application/json; charset=utf-8')
             self.end_headers()
@@ -2725,9 +2827,44 @@ class RequestHandler(BaseHTTPRequestHandler):
             # #endregion
             parsed = urllib.parse.urlparse(self.path)
             params = urllib.parse.parse_qs(parsed.query)
-            game_state = {k: v[0] for k, v in params.items()}
+            # Flatten list values from parse_qs (e.g. ?hand_description=foo -> hand_description='foo')
+            def _first(v):
+                return v[0] if isinstance(v, list) and len(v) else (v if not isinstance(v, list) else '')
+            game_state = {k: _first(v) for k, v in params.items()}
+            hand_description = (game_state.get('hand_description') or '').strip()
+            # Check if structured fields are filled (hole_cards, pot, or bet)
+            hole_cards = (game_state.get('hole_cards') or '').strip()
+            pot = (game_state.get('pot') or '').strip()
+            bet = (game_state.get('bet') or '').strip()
+            has_structured = bool(hole_cards or pot or bet)
+            if hand_description and not has_structured:
+                parsed_desc = HandDescriptionParser.parse_hand_description(hand_description)
+                if not parsed_desc.get('success'):
+                    result = {
+                        'error': 'Could not parse hand description. Please fill the structured fields or click Fill form only.'
+                    }
+                    self.send_response(400)
+                    self.send_header('Content-type', 'application/json; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(result).encode('utf-8'))
+                    return
+                game_state = {
+                    'pot': parsed_desc.get('pot', 0),
+                    'bet': parsed_desc.get('bet', 0),
+                    'your_stack': parsed_desc.get('your_stack', 8000),
+                    'opp_stack': parsed_desc.get('opp_stack', 8000),
+                    'small_blind': parsed_desc.get('small_blind', 1),
+                    'big_blind': parsed_desc.get('big_blind', 3),
+                    'street': parsed_desc.get('street', 'river'),
+                    'position': parsed_desc.get('position', 'utg'),
+                    'opponent_action': parsed_desc.get('opponent_action', 'BET'),
+                    'opponent': parsed_desc.get('opponent', ''),
+                    'hole_cards': parsed_desc.get('hole_cards', ''),
+                    'board_cards': parsed_desc.get('board_cards', ''),
+                    'action_history': json.dumps(parsed_desc.get('action_history', [])),
+                    'proposed_action': parsed_desc.get('proposed_action'),
+                }
             result = assistant.analyze(game_state)
-            
             self.send_response(200)
             self.send_header('Content-type', 'application/json; charset=utf-8')
             self.end_headers()
