@@ -1,3 +1,8 @@
+Core idea:
+A stateful agent that builds persistent internal models of other agents
+from interaction, and conditions its decisions on those learned beliefs.
+Poker is used as a controlled testbed for repeated, adversarial interaction.
+
 PokerVision: Exploitative Poker AI
 ==================================
 PokerVision is a stateful agent operating in a multi-agent environment that learns persistent, opponent-specific behavioral models from interaction logs. Rather than optimizing for equilibrium play, it infers how other agents deviate from idealized assumptions and conditions its decisions on those learned internal models. Poker is used as a controlled testbed for studying behavioral world modeling under uncertainty.
@@ -61,17 +66,20 @@ Inside `pokervision_github/` the most useful scripts and docs are:
 
 How it Works
 ------------
-How it Works (Conceptual)
-PokerVision maintains an internal belief state over other agents and updates it through interaction.
 
-1. Inference (within an episode)
-From the current public state and action history, the model infers latent opponent tendencies conditioned on context (position, stack depth, cards).
+### World model: opponent beliefs and conditioning
 
-2. Belief update (across episodes)
-Observed actions update persistent opponent representations, which serve as memory across hands.
+PokerVision maintains an internal **belief state** over other agents and updates it through interaction.
 
-3. Decision conditioning
-Action selection is conditioned jointly on the environment state and inferred opponent models, allowing behavior to adapt over repeated interaction.
+1. **Belief state (what is represented)**  
+   For each opponent, the agent stores a persistent summary of latent behavioural tendencies (propensity to fold under pressure, call-down frequency, aggression by position and stack depth). This is encoded as a feature vector / embedding that serves as an approximation of the opponent’s policy.
+
+2. **Online belief update (how it learns)**  
+   After each observed action, the belief state is updated online using new evidence from the hand (action taken, context, outcome). Updates are incremental and confidence-weighted, so representations refine over repeated interaction while remaining robust to short-term variance.
+
+3. **Policy conditioning (how it decides)**  
+   At decision time, the policy conditions jointly on the current environment state and the opponent belief state. The belief modulates action preferences—for example, applying more pressure to inferred over-folders or favouring thin value bets versus calling stations—so behaviour adapts to specific opponents instead of playing a static equilibrium strategy.
+
 In short:
 
 ```text
