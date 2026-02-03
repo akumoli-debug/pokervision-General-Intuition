@@ -60,11 +60,22 @@ Rather than approximating equilibrium play, the model conditions decisions on in
 
 ## 🚀 Quick Start
 
-### Installation
+### 10‑second demo
+
+If you just want to see something run immediately (no data, no model files):
+
+```bash
+pip install -r requirements.txt
+python demo.py
+```
+
+This uses a tiny heuristic script (`demo.py`) that prints a few example hands and the kind of exploitative recommendations PokerVision is designed to learn (e.g., "over-folder → bluff more", "calling station → value only").
+
+### Full installation
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/pokervision.git
-cd pokervision
+git clone https://github.com/akumoli-debug/pokervision-General-Intuition.git
+cd pokervision-General-Intuition/pokervision_github
 
 # Install dependencies
 pip install -r requirements.txt
