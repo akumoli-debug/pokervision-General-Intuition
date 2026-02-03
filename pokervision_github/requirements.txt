@@ -1,0 +1,14 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Optional: Live UI
+pillow>=10.0.0
+pytesseract>=0.3.10
+mss>=9.0.0
+
+# Optional: Data analysis
+matplotlib>=3.7.0
+seaborn>=0.12.0
+jupyter>=1.0.0
