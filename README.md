@@ -1,6 +1,7 @@
 PokerVision: Exploitative Poker AI
 ==================================
 PokerVision is a stateful agent operating in a multi-agent environment that learns persistent, opponent-specific behavioral models from interaction logs. Rather than optimizing for equilibrium play, it infers how other agents deviate from idealized assumptions and conditions its decisions on those learned internal models. Poker is used as a controlled testbed for studying behavioral world modeling under uncertainty.
+
 A stateful agent that builds internal models of other agents and conditions decisions on them.
 Built as a lightweight research project to demonstrate how behavioural modelling can outperform static “play-perfect” solvers against real, non‑optimal opponents.
 
