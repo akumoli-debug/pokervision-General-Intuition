@@ -41,6 +41,18 @@ if str(PROJECT_ROOT) not in sys.path:
 from belief.opponent_belief import OpponentBelief, HandHistory, StreetAction  # type: ignore
 from telemetry.logger import log_event  # type: ignore
 
+# #region agent log
+DEBUG_LOG = Path(__file__).resolve().parent.parent.parent / ".cursor" / "debug.log"  # workspace/.cursor/debug.log
+def _debug_log(msg, data=None, hypothesis_id=None):
+    try:
+        import time
+        line = json.dumps({"message": msg, "data": data or {}, "hypothesisId": hypothesis_id, "timestamp": time.time(), "location": "live_ui_fixed.py"}) + "\n"
+        with open(DEBUG_LOG, "a") as f:
+            f.write(line)
+    except Exception:
+        pass
+# #endregion
+
 # Load model
 MODEL_PATH = 'models/final_model.pt'
 DATA_PATH = 'data/akumoli_final_merged.json'
@@ -144,149 +156,172 @@ class HandDescriptionParser:
         return card_str
     
     @staticmethod
+    def _parse_amount(s: str, full_match: str) -> float:
+        """Parse amount from match; handle 2k, 6.7k, 400, etc."""
+        s = s.strip()
+        if not s:
+            return 0.0
+        val = float(s)
+        if 'k' in full_match.lower():
+            return val * 1000
+        return val
+
+    @staticmethod
+    def _board_to_cards(board_str: str) -> str:
+        """Convert board string like 'T42' or 'T 4 2' to Ah Kd format with default suits."""
+        suits = 'hdsc'
+        cards = []
+        for i, c in enumerate(re.sub(r'[^AKQJT2-9]', '', board_str.upper())):
+            suit = suits[i % 4]
+            cards.append(c + suit)
+        return ' '.join(cards) if cards else ''
+
+    @staticmethod
     def parse_hand_description(text):
         """
         Parse natural language hand description.
         
-        Example input:
-        "Home game. 1/3 8k effective. 9 handed.
-         Raise KTo UTG to 20. BU 3 bets to 100. I call.
-         Flop T42r. I check. He bets 400. I call.
-         Turn 7r. I check. He bets 850. I call.
-         River 2. I check. He bets 2k. I move in for 6.7k total."
+        Handles: "1/3 8k effective", "Raise KTo UTG to 20", "BU 3 bets to 100",
+        "Flop T42r", "Turn 7r", "River 2", "He bets 2k", "move in for 6.7k total".
         """
         parsed = {}
         text_lower = text.lower()
         
-        # Extract blinds (1/3, $1/$3, etc.)
+        # Blinds (1/3, $1/$3)
         blind_match = re.search(r'(\d+)\s*[/-]\s*(\d+)', text)
         if blind_match:
-            sb = float(blind_match.group(1))
-            bb = float(blind_match.group(2))
-            parsed['small_blind'] = sb
-            parsed['big_blind'] = bb
-        
-        # Extract effective stack (8k, 8000, $8k, etc.)
-        stack_match = re.search(r'(\d+(?:\.\d+)?)\s*k\b', text_lower)
-        if stack_match:
-            stack_k = float(stack_match.group(1))
-            parsed['your_stack'] = stack_k * 1000
-            parsed['opp_stack'] = stack_k * 1000  # Assume same for now
+            parsed['small_blind'] = float(blind_match.group(1))
+            parsed['big_blind'] = float(blind_match.group(2))
         else:
-            # Try regular number
-            stack_match = re.search(r'\$?(\d{3,})', text)
-            if stack_match:
-                stack_val = float(stack_match.group(1))
-                parsed['your_stack'] = stack_val
-                parsed['opp_stack'] = stack_val
+            parsed['small_blind'] = 1
+            parsed['big_blind'] = 2
         
-        # Extract position (UTG, BU/Button, CO, etc.)
-        position_map = {
-            'utg': 'utg',
-            'button': 'button',
-            'bu': 'button',
-            'btn': 'button',
-            'sb': 'sb',
-            'small blind': 'sb',
-            'bb': 'bb',
-            'big blind': 'bb',
-            'co': 'co',
-            'cutoff': 'co',
-            'hj': 'hj',
-            'hijack': 'hj',
-        }
-        for keyword, pos in position_map.items():
-            if keyword in text_lower:
-                parsed['position'] = pos
-                break
+        # Effective stack (8k, 6.7k, 8000)
+        stack_vals = []
+        for m in re.finditer(r'(\d+(?:\.\d+)?)\s*k\s*(?:effective|total)?', text_lower):
+            stack_vals.append(float(m.group(1)) * 1000)
+        if not stack_vals:
+            for m in re.finditer(r'\b(\d{3,})\b', text):
+                n = float(m.group(1))
+                if 100 <= n <= 100000:
+                    stack_vals.append(n)
+        if stack_vals:
+            parsed['your_stack'] = max(stack_vals)
+            parsed['opp_stack'] = max(stack_vals)
         
-        # Extract hole cards (KTo, Ah Kd, etc.)
-        # Look for card patterns near "raise", "call", or position
+        # Position from "UTG", "BU", "raise ... UTG"
+        if 'utg' in text_lower:
+            parsed['position'] = 'utg'
+        elif ' bu ' in text_lower or 'button' in text_lower or ' btn ' in text_lower:
+            parsed['position'] = 'button'
+        elif 'co' in text_lower or 'cutoff' in text_lower:
+            parsed['position'] = 'co'
+        elif 'hj' in text_lower or 'hijack' in text_lower:
+            parsed['position'] = 'hj'
+        elif 'sb' in text_lower or 'small blind' in text_lower:
+            parsed['position'] = 'sb'
+        elif 'bb' in text_lower or 'big blind' in text_lower:
+            parsed['position'] = 'bb'
+        else:
+            parsed['position'] = 'utg'
+        
+        # Hole cards: "Raise KTo UTG", "KTo", "Ah Kd"
         card_patterns = [
             r'raise\s+([AKQJT2-9][hdcs]?\s*[AKQJT2-9][hdcs]?[os]?)',
             r'([AKQJT2-9][hdcs]\s+[AKQJT2-9][hdcs])',
-            r'([AKQJT2-9]{1,2}[os]?)\s+UTG',
-            r'([AKQJT2-9]{1,2}[os]?)\s+BU',
+            r'\b([AKQJT2-9]{1,2}[os]?)\s+UTG',
+            r'\b([AKQJT2-9]{1,2}[os]?)\s+BU',
+            r'\b([AKQJT2-9]T[os]?)\b',
+            r'\b(KTo|KTs|QJo|AK)\b',
         ]
         for pattern in card_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                cards = HandDescriptionParser.parse_card_notation(match.group(1))
-                parsed['hole_cards'] = cards
-                break
+                cards = HandDescriptionParser.parse_card_notation(match.group(1).strip())
+                if cards and len(cards) >= 3:
+                    parsed['hole_cards'] = cards
+                    break
         
-        # Extract street and board cards
-        # Flop: T42r, T 4 2, etc.
-        flop_match = re.search(r'flop\s+([AKQJT2-9hdcs\s]+)', text_lower)
+        # Build board from Flop / Turn / River
+        flop_str = ''
+        turn_str = ''
+        river_str = ''
+        flop_match = re.search(r'flop\s+([AKQJT2-9hdcs\s\.]+?)(?=\s*[\.\n]|\s+turn\s+|\s+river\s+|$)', text_lower, re.DOTALL | re.IGNORECASE)
         if flop_match:
-            board = flop_match.group(1).strip()
-            # Clean up board notation
-            board = re.sub(r'[^AKQJT2-9hdcs\s]', '', board)
-            parsed['board_cards'] = board
-            parsed['street'] = 'flop'
-        
-        turn_match = re.search(r'turn\s+([AKQJT2-9hdcs\s]+)', text_lower)
+            flop_str = re.sub(r'[^AKQJT2-9]', '', flop_match.group(1))
+        turn_match = re.search(r'turn\s+([AKQJT2-9hdcs\s\.]+?)(?=\s*[\.\n]|\s+river\s+|$)', text_lower, re.DOTALL | re.IGNORECASE)
         if turn_match:
-            board = turn_match.group(1).strip()
-            board = re.sub(r'[^AKQJT2-9hdcs\s]', '', board)
-            parsed['board_cards'] = board
-            parsed['street'] = 'turn'
-        
-        river_match = re.search(r'river\s+([AKQJT2-9hdcs\s]+)', text_lower)
+            turn_str = re.sub(r'[^AKQJT2-9]', '', turn_match.group(1))
+        river_match = re.search(r'river\s+([AKQJT2-9hdcs\s\.]+?)(?=\s*[\.\n]|\s+I\s+|\s+he\s+|\s+what\s+|$)', text_lower, re.DOTALL | re.IGNORECASE)
         if river_match:
-            board = river_match.group(1).strip()
-            board = re.sub(r'[^AKQJT2-9hdcs\s]', '', board)
-            parsed['board_cards'] = board
+            river_str = re.sub(r'[^AKQJT2-9]', '', river_match.group(1))
+        
+        full_board = flop_str + turn_str + river_str
+        if full_board:
+            parsed['board_cards'] = HandDescriptionParser._board_to_cards(full_board)
+        
+        # Street: if "river" mentioned and we're asking about the decision, use river
+        if 'river' in text_lower or river_str:
             parsed['street'] = 'river'
+        elif turn_str:
+            parsed['street'] = 'turn'
+        elif flop_str:
+            parsed['street'] = 'flop'
+        else:
+            parsed['street'] = 'preflop'
         
-        # Extract pot and bet amounts
-        # Look for "bets X", "bet X", "to X", "move in for X"
-        bet_patterns = [
-            r'(?:bet|bets)\s+\$?(\d+(?:\.\d+)?)\s*k?',
-            r'to\s+\$?(\d+(?:\.\d+)?)',
-            r'move\s+in\s+for\s+\$?(\d+(?:\.\d+)?)\s*k?',
-            r'(\d+(?:\.\d+)?)\s*k\s+total',
-        ]
-        
-        # Get the last bet mentioned (most recent action)
+        # Bet to you: "He bets 2k", "bets 400", "bet 2k"
         last_bet = None
-        for pattern in bet_patterns:
-            matches = list(re.finditer(pattern, text_lower))
-            if matches:
-                last_match = matches[-1]  # Most recent
-                bet_str = last_match.group(1)
-                if 'k' in last_match.group(0).lower():
-                    last_bet = float(bet_str) * 1000
-                else:
-                    last_bet = float(bet_str)
-                break
-        
-        if last_bet:
+        for m in re.finditer(r'(?:he\s+)?(?:bet|bets)\s+\$?(\d+(?:\.\d+)?)\s*(k)?', text_lower):
+            last_bet = float(m.group(1)) * (1000 if m.group(2) else 1)
+        if last_bet is not None:
             parsed['bet'] = last_bet
-            # Estimate pot (rough heuristic: sum of all bets mentioned)
-            pot_estimates = []
-            for pattern in bet_patterns:
-                for match in re.finditer(pattern, text_lower):
-                    bet_str = match.group(1)
-                    if 'k' in match.group(0).lower():
-                        pot_estimates.append(float(bet_str) * 1000)
-                    else:
-                        pot_estimates.append(float(bet_str))
-            if pot_estimates:
-                parsed['pot'] = sum(pot_estimates) * 0.5  # Rough estimate
         
-        # Extract opponent action from last street
-        if 'check' in text_lower and 'bet' in text_lower:
-            # If we checked and they bet, opponent action is BET
+        # Pot estimate: sum of money in before opponent's current bet
+        sb = parsed.get('small_blind', 1)
+        bb = parsed.get('big_blind', 2)
+        pot_before_current_bet = sb + bb
+        bets_found = []
+        for m in re.finditer(r'(?:to|bet|bets?)\s+\$?(\d+(?:\.\d+)?)\s*(k)?', text_lower):
+            amt = float(m.group(1)) * (1000 if m.group(2) else 1)
+            bets_found.append(amt)
+        # Each bet we see went in twice (villain + hero call) except the last one (villain's current bet)
+        for i, amt in enumerate(bets_found):
+            if i < len(bets_found) - 1:
+                pot_before_current_bet += amt * 2
+            else:
+                pot_before_current_bet += amt  # villain's bet already in
+        if pot_before_current_bet > 0:
+            parsed['pot'] = max(int(pot_before_current_bet), (parsed.get('bet') or 0) * 2)
+        elif parsed.get('bet'):
+            parsed['pot'] = parsed['bet'] * 3  # fallback
+        
+        # Opponent action this street
+        if 'river' in text_lower and ('bet' in text_lower or '2k' in text_lower or 'move in' in text_lower):
             parsed['opponent_action'] = 'BET'
+        elif 'check' in text_lower and 'bet' in text_lower:
+            parsed['opponent_action'] = 'BET'
+        elif '3 bet' in text_lower or '3-bet' in text_lower:
+            parsed['opponent_action'] = 'RAISE'
         elif 'call' in text_lower:
             parsed['opponent_action'] = 'CALL'
-        elif 'raise' in text_lower or '3 bet' in text_lower:
-            parsed['opponent_action'] = 'RAISE'
+        else:
+            parsed['opponent_action'] = 'BET'
+        
+        # Action history for model
+        action_history = []
+        if re.search(r'3\s*bet|raise.*to\s+\d+', text_lower):
+            action_history.append({'street': 'preflop', 'action': 'RAISE', 'bet_size': 100, 'pot_size': 30})
+        if flop_str and re.search(r'he\s+bet|bet\s+\d+', text_lower):
+            action_history.append({'street': 'flop', 'action': 'BET', 'bet_size': 400, 'pot_size': 200})
+        if turn_str and re.search(r'turn.*he\s+bet|bet\s+850', text_lower):
+            action_history.append({'street': 'turn', 'action': 'BET', 'bet_size': 850, 'pot_size': 1000})
+        if river_str and last_bet:
+            action_history.append({'street': 'river', 'action': 'BET', 'bet_size': last_bet, 'pot_size': parsed.get('pot', 0)})
+        parsed['action_history'] = action_history
         
         parsed['raw_description'] = text
         parsed['success'] = True
-        
         return parsed
 
 
@@ -1748,13 +1783,15 @@ HTML = """
                 
                 <div id="manualTab" class="tab-content active">
                 <form id="gameForm">
-                    <div class="hand-description-section">
-                        <h3>📝 Or Type Hand Description</h3>
-                        <div class="input-group">
-                            <label>Paste hand history (e.g., "1/3 8k effective. Raise KTo UTG to 20. Flop T42r. I check. He bets 400...")</label>
-                            <textarea id="hand_description" placeholder='Example: Home game. 1/3 8k effective. Raise KTo UTG to 20. BU 3 bets to 100. I call. Flop T42r. I check. He bets 400. I call. Turn 7r. I check. He bets 850. I call. River 2. I check. He bets 2k. I move in for 6.7k total.' style="min-height: 120px;"></textarea>
-                            <button type="button" class="parse-btn" onclick="parseHandDescription()">🔍 Parse & Fill Form</button>
+                    <div class="hand-description-section" style="margin-bottom: 20px;">
+                        <h3>📝 Describe your hand (like ChatGPT)</h3>
+                        <p style="color: #666; font-size: 14px; margin-bottom: 10px;">Paste a hand history or describe the situation. We'll parse it and give a recommendation.</p>
+                        <textarea id="hand_description" placeholder="e.g. Home game. 1/3 8k effective. Raise KTo UTG to 20. BU 3-bets to 100. I call. Flop T42r. I check. He bets 400. I call. Turn 7r. I check. He bets 850. I call. River 2. I check. He bets 2k. What do you think?" style="min-height: 140px; width: 100%; padding: 12px; border-radius: 8px; border: 2px solid #ddd; font-size: 14px;"></textarea>
+                        <div style="margin-top: 10px; display: flex; gap: 10px; flex-wrap: wrap;">
+                            <button type="button" class="parse-btn" onclick="analyzeFromDescription()" style="padding: 12px 24px; font-size: 16px;">🎯 Analyze & Recommend</button>
+                            <button type="button" class="parse-btn" onclick="parseHandDescription()" style="background: #64748b; padding: 10px 18px;">Fill form only</button>
                         </div>
+                        <div id="descriptionResult" style="display: none; margin-top: 16px;"></div>
                     </div>
                     
                     <div class="card-input-section">
@@ -1916,65 +1953,120 @@ HTML = """
     </div>
     
     <script>
-        function switchTab(tabName, btn) {
-            // Hide all tabs
-            document.querySelectorAll('.tab-content').forEach(tab => {
-                tab.classList.remove('active');
-            });
-            document.querySelectorAll('.tab').forEach(btn => {
-                btn.classList.remove('active');
-            });
-            
-            // Show selected tab
-            document.getElementById(tabName + 'Tab').classList.add('active');
-            if (btn) {
-                btn.classList.add('active');
+        function switchTab(tabName, clickedBtn) {
+            try {
+                console.log('[DEBUG] switchTab called:', tabName, 'clickedBtn:', !!clickedBtn);
+                // #region agent log
+                var tabEl = document.getElementById(tabName + 'Tab');
+                console.log('[DEBUG] tabEl found:', !!tabEl, 'id:', tabName + 'Tab');
+                fetch('http://127.0.0.1:7243/ingest/b4103c64-22ce-4509-985b-06f21511cca0',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'switchTab',message:'switchTab called',data:{tabName:tabName,hasTabEl:!!tabEl,tabId:tabName+'Tab',hasClickedBtn:!!clickedBtn},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H4'})}).catch(function(e){console.error('[DEBUG] log fetch failed:',e);});
+                // #endregion
+                // Hide all tab contents and tab buttons
+                var allTabs = document.querySelectorAll('.tab-content');
+                console.log('[DEBUG] Found', allTabs.length, 'tab-content elements');
+                allTabs.forEach(function(tab) {
+                    tab.classList.remove('active');
+                });
+                document.querySelectorAll('.tab').forEach(function(t) {
+                    t.classList.remove('active');
+                });
+                if (tabEl) {
+                    tabEl.classList.add('active');
+                    console.log('[DEBUG] Added active to tabEl');
+                } else {
+                    console.error('[DEBUG] tabEl is null! Looking for:', tabName + 'Tab');
+                }
+                if (clickedBtn) {
+                    clickedBtn.classList.add('active');
+                    console.log('[DEBUG] Added active to clickedBtn');
+                }
+            } catch (e) {
+                console.error('[DEBUG] switchTab error:', e);
+            }
+        }
+        
+        async function analyzeFromDescription() {
+            try {
+                console.log('[DEBUG] analyzeFromDescription called');
+                var text = document.getElementById('hand_description').value.trim();
+                var resultDiv = document.getElementById('descriptionResult');
+                console.log('[DEBUG] text length:', text.length, 'resultDiv:', !!resultDiv);
+                // #region agent log
+                fetch('http://127.0.0.1:7243/ingest/b4103c64-22ce-4509-985b-06f21511cca0',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'analyzeFromDescription',message:'entry',data:{textLen:text.length,hasResultDiv:!!resultDiv},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H3'})}).catch(function(e){console.error('[DEBUG] log fetch failed:',e);});
+                // #endregion
+                if (!text) {
+                    resultDiv.style.display = 'block';
+                    resultDiv.innerHTML = '<div class="ocr-result error"><strong>Please enter a hand description.</strong></div>';
+                    return;
+                }
+                resultDiv.style.display = 'block';
+                resultDiv.innerHTML = '<div style="padding: 20px; text-align: center; color: #666;">Analyzing...</div>';
+                console.log('[DEBUG] About to fetch /api/analyze_description');
+                var url = '/api/analyze_description?' + new URLSearchParams({ text: text });
+                console.log('[DEBUG] URL length:', url.length);
+                var response = await fetch(url);
+                console.log('[DEBUG] Response status:', response.status, 'ok:', response.ok);
+                var result = await response.json();
+                console.log('[DEBUG] Result received, has action:', !!result.action, 'has error:', !!result.error);
+                // #region agent log
+                fetch('http://127.0.0.1:7243/ingest/b4103c64-22ce-4509-985b-06f21511cca0',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'analyzeFromDescription',message:'after fetch',data:{ok:response.ok,status:response.status,hasError:!!result.error,hasAction:!!result.action},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H3'})}).catch(function(){});
+                // #endregion
+                if (result.error) {
+                    resultDiv.innerHTML = '<div class="ocr-result error"><strong>Error:</strong> ' + result.error + '</div>';
+                    return;
+                }
+                resultDiv.innerHTML = '';
+                var card = document.createElement('div');
+                card.className = 'card';
+                card.style.marginTop = '12px';
+                card.innerHTML = '<div class="recommendation"><div class="rec-action">' + result.action + '</div><div class="rec-bet-size">' + (result.bet_size || '') + '</div><div class="rec-reasoning">' + (result.reasoning || '') + '</div></div>';
+                if (result._parsed && result._parsed.hole_cards) {
+                    card.innerHTML += '<p style="margin: 10px 0; font-size: 14px;"><strong>Parsed:</strong> ' + result._parsed.hole_cards + ' on ' + (result._parsed.board_cards || '') + ' | Pot $' + (result._parsed.pot || 0) + ', Bet $' + (result._parsed.bet || 0) + ' | ' + (result._parsed.street || '') + '</p>';
+                }
+                resultDiv.appendChild(card);
+                displayResult(result);
+                var mainResult = document.getElementById('result');
+                if (mainResult) mainResult.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            } catch (e) {
+                console.error('[DEBUG] analyzeFromDescription error:', e);
+                // #region agent log
+                fetch('http://127.0.0.1:7243/ingest/b4103c64-22ce-4509-985b-06f21511cca0',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'analyzeFromDescription',message:'catch',data:{error:e.message,stack:e.stack},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H3'})}).catch(function(err){console.error('[DEBUG] log fetch failed:',err);});
+                // #endregion
+                resultDiv.innerHTML = '<div class="ocr-result error"><strong>Error:</strong> ' + e.message + '</div>';
             }
         }
         
         function parseHandDescription() {
-            const text = document.getElementById('hand_description').value.trim();
+            var text = document.getElementById('hand_description').value.trim();
             if (!text) {
                 alert('Please enter a hand description');
                 return;
             }
-            
-            try {
-                // Send to backend for parsing
-                fetch('/api/parse_description?' + new URLSearchParams({text: text}))
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.error) {
-                            alert('Parse error: ' + data.error);
-                            return;
-                        }
-                        
-                        // Fill form fields
-                        if (data.small_blind) document.getElementById('small_blind').value = data.small_blind;
-                        if (data.big_blind) document.getElementById('big_blind').value = data.big_blind;
-                        if (data.your_stack) document.getElementById('your_stack').value = data.your_stack;
-                        if (data.opp_stack) document.getElementById('opp_stack').value = data.opp_stack || data.your_stack;
-                        if (data.position) document.getElementById('position').value = data.position;
-                        if (data.hole_cards) document.getElementById('hole_cards').value = data.hole_cards;
-                        if (data.board_cards) document.getElementById('board_cards').value = data.board_cards;
-                        if (data.street) document.getElementById('street').value = data.street;
-                        if (data.pot) document.getElementById('pot').value = data.pot;
-                        if (data.bet) document.getElementById('bet').value = data.bet;
-                        if (data.opponent_action) document.getElementById('opponent_action').value = data.opponent_action;
-                        
-                        // Store raw description in action notes
-                        if (data.raw_description) {
-                            document.getElementById('action_notes').value = 'Parsed from: ' + data.raw_description.substring(0, 200);
-                        }
-                        
-                        alert('✓ Form filled! Review and click Analyze.');
-                    })
-                    .catch(error => {
-                        alert('Error parsing: ' + error.message);
-                    });
-            } catch (error) {
-                alert('Error: ' + error.message);
-            }
+            fetch('/api/parse_description?' + new URLSearchParams({ text: text }))
+                .then(function(response) { return response.json(); })
+                .then(function(data) {
+                    if (data.error) {
+                        alert('Parse error: ' + data.error);
+                        return;
+                    }
+                    if (data.small_blind != null) document.getElementById('small_blind').value = data.small_blind;
+                    if (data.big_blind != null) document.getElementById('big_blind').value = data.big_blind;
+                    if (data.your_stack != null) document.getElementById('your_stack').value = data.your_stack;
+                    if (data.opp_stack != null) document.getElementById('opp_stack').value = data.opp_stack || data.your_stack;
+                    if (data.position) document.getElementById('position').value = data.position;
+                    if (data.hole_cards) document.getElementById('hole_cards').value = data.hole_cards;
+                    if (data.board_cards) document.getElementById('board_cards').value = data.board_cards;
+                    if (data.street) document.getElementById('street').value = data.street;
+                    if (data.pot != null) document.getElementById('pot').value = data.pot;
+                    if (data.bet != null) document.getElementById('bet').value = data.bet;
+                    if (data.opponent_action) document.getElementById('opponent_action').value = data.opponent_action;
+                    if (data.action_history && data.action_history.length) {
+                        document.getElementById('action_history').value = JSON.stringify(data.action_history, null, 2);
+                    }
+                    if (data.raw_description) document.getElementById('action_notes').value = 'Parsed: ' + data.raw_description.substring(0, 150);
+                    alert('Form filled. Click "Analyze & Recommend" below to run the model.');
+                })
+                .catch(function(err) { alert('Error: ' + err.message); });
         }
         
         async function captureScreen() {
@@ -2304,6 +2396,11 @@ HTML = """
         let pendingCaptureData = null;
         let sortedPlayersList = null;  // Store sorted players for selection
         
+        function closePlayerModal() {
+            const modal = document.getElementById('playerSelectModal');
+            if (modal) modal.classList.remove('active');
+        }
+        
         function showPlayerSelection(players, captureData) {
             pendingCaptureData = captureData;
             const modal = document.getElementById('playerSelectModal');
@@ -2322,7 +2419,7 @@ HTML = """
             let html = '<h3>👤 Who are you in this screenshot?</h3>';
             if (sortedPlayers.length === 0) {
                 html += '<p>No players detected. Please enter data manually.</p>';
-                html += '<button class="select-player-btn" onclick="document.getElementById(\'playerSelectModal\').classList.remove(\'active\')">Close</button>';
+                html += '<button class="select-player-btn" type="button" onclick="closePlayerModal()">Close</button>';
                 content.innerHTML = html;
                 return;
             }
@@ -2342,22 +2439,22 @@ HTML = """
                 // Disable selection for all-in players (you can't be all-in)
                 const disabledClass = player.all_in ? 'disabled' : '';
                 const disabledStyle = player.all_in ? 'opacity: 0.5; cursor: not-allowed;' : '';
-                const onClick = player.all_in ? '' : `onclick="selectPlayer(${idx})"`;
+                const onClickAttr = player.all_in ? '' : 'onclick="selectPlayer(' + idx + ')"';
                 
-                html += `
-                    <div class="player-option ${isSelected} ${disabledClass}" ${onClick} style="${disabledStyle}">
-                        <div class="player-name">${player.name}${badgeText}</div>
-                        <div class="player-details">${stackText}${cards}</div>
-                        ${player.all_in ? '<div style="color: #ef4444; font-size: 12px; margin-top: 5px;">⚠️ This player is all-in - you cannot be this player</div>' : ''}
-                    </div>
-                `;
+                html += '<div class="player-option ' + isSelected + ' ' + disabledClass + '" ' + onClickAttr + ' style="' + disabledStyle + '">';
+                html += '<div class="player-name">' + (player.name || '') + badgeText + '</div>';
+                html += '<div class="player-details">' + stackText + (cards || '') + '</div>';
+                if (player.all_in) {
+                    html += '<div style="color: #ef4444; font-size: 12px; margin-top: 5px;">⚠️ This player is all-in - you cannot be this player</div>';
+                }
+                html += '</div>';
             });
             
             // Find first non-all-in player as default selection
             const defaultIdx = sortedPlayers.findIndex(p => !p.all_in);
             const selectedIdx = defaultIdx >= 0 ? defaultIdx : 0;
             
-            html += '<button class="select-player-btn" onclick="confirmPlayerSelection()">Select Player</button>';
+            html += '<button class="select-player-btn" type="button" onclick="confirmPlayerSelection()">Select Player</button>';
             
             content.innerHTML = html;
             if (sortedPlayers.length > 0) {
@@ -2470,16 +2567,64 @@ HTML = """
 
 class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        # #region agent log
+        _debug_log("do_GET path", {"path": self.path, "path_len": len(self.path)}, "H1")
+        # #endregion
         if self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'text/html; charset=utf-8')
             self.end_headers()
-            self.wfile.write(HTML.encode('utf-8'))
+            try:
+                self.wfile.write(HTML.encode('utf-8'))
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # Client disconnected before response finished (e.g. refresh, navigate away)
+        
+        elif self.path.startswith('/api/analyze_description'):
+            # Parse hand description and run analysis (must be checked before /api/analyze)
+            # #region agent log
+            _debug_log("branch taken", {"branch": "analyze_description"}, "H1")
+            # #endregion
+            parsed_url = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed_url.query)
+            text = params.get('text', [''])[0]
+            # #region agent log
+            _debug_log("analyze_description text", {"text_len": len(text), "has_text": bool(text)}, "H2")
+            # #endregion
+            if not text:
+                result = {'error': 'No description text provided'}
+            else:
+                parsed = HandDescriptionParser.parse_hand_description(text)
+                if not parsed.get('success'):
+                    result = {'error': 'Could not parse hand description'}
+                else:
+                    game_state = {
+                        'pot': parsed.get('pot', 0),
+                        'bet': parsed.get('bet', 0),
+                        'your_stack': parsed.get('your_stack', 8000),
+                        'opp_stack': parsed.get('opp_stack', 8000),
+                        'small_blind': parsed.get('small_blind', 1),
+                        'big_blind': parsed.get('big_blind', 3),
+                        'street': parsed.get('street', 'river'),
+                        'position': parsed.get('position', 'utg'),
+                        'opponent_action': parsed.get('opponent_action', 'BET'),
+                        'opponent': parsed.get('opponent', ''),
+                        'hole_cards': parsed.get('hole_cards', ''),
+                        'board_cards': parsed.get('board_cards', ''),
+                        'action_history': json.dumps(parsed.get('action_history', [])),
+                    }
+                    result = assistant.analyze(game_state)
+                    result['_parsed'] = {k: v for k, v in parsed.items() if k != 'raw_description'}
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode('utf-8'))
         
         elif self.path.startswith('/api/analyze'):
+            # #region agent log
+            _debug_log("branch taken", {"branch": "analyze"}, "H1")
+            # #endregion
             parsed = urllib.parse.urlparse(self.path)
             params = urllib.parse.parse_qs(parsed.query)
-            
             game_state = {k: v[0] for k, v in params.items()}
             result = assistant.analyze(game_state)
             
@@ -2498,9 +2643,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(result).encode('utf-8'))
         
         elif self.path.startswith('/api/parse_description'):
-            # Parse natural language hand description
-            parsed = urllib.parse.urlparse(self.path)
-            params = urllib.parse.parse_qs(parsed.query)
+            parsed_url = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed_url.query)
             text = params.get('text', [''])[0]
             
             if not text:
@@ -2514,6 +2658,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(result).encode('utf-8'))
         
         else:
+            # #region agent log
+            _debug_log("404 path", {"path": self.path, "path_start": self.path[:50]}, "H1")
+            # #endregion
             self.send_response(404)
             self.end_headers()
     
