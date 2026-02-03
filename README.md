@@ -1,7 +1,7 @@
 PokerVision: Exploitative Poker AI
 ==================================
-
-An AI poker assistant that learns opponent-specific behaviour from hand histories and recommends exploitative actions in real time.  
+PokerVision is a stateful agent operating in a multi-agent environment that learns persistent, opponent-specific behavioral models from interaction logs. Rather than optimizing for equilibrium play, it infers how other agents deviate from idealized assumptions and conditions its decisions on those learned internal models. Poker is used as a controlled testbed for studying behavioral world modeling under uncertainty.
+A stateful agent that builds internal models of other agents and conditions decisions on them.
 Built as a lightweight research project to demonstrate how behavioural modelling can outperform static “play-perfect” solvers against real, non‑optimal opponents.
 
 Demo
@@ -37,19 +37,17 @@ python scripts/live_ui_fixed.py
 
 How it Works
 ------------
+How it Works (Conceptual)
+PokerVision maintains an internal belief state over other agents and updates it through interaction.
 
-Conceptually, each decision goes through a three-step loop:
+1. Inference (within an episode)
+From the current public state and action history, the model infers latent opponent tendencies conditioned on context (position, stack depth, cards).
 
-1. **Per-hand inference**
-   - Input: current hand state (stacks, pot, position, street, actions, cards) + opponent features.
-   - A neural network with scalar features and card embeddings predicts action logits and value.
-2. **Opponent memory update**
-   - After each observed action, opponent statistics (fold frequency, aggression, etc.) are updated.
-   - These summary stats become features for future decisions against the same player.
-3. **Action selection**
-   - The assistant converts logits into a discrete recommendation (fold / call / small bet / big bet / shove).
-   - Explanations are based on SPR, position and opponent tendencies (e.g., “over-folds vs pressure”).
+2. Belief update (across episodes)
+Observed actions update persistent opponent representations, which serve as memory across hands.
 
+3. Decision conditioning
+Action selection is conditioned jointly on the environment state and inferred opponent models, allowing behavior to adapt over repeated interaction.
 In short:
 
 ```text
