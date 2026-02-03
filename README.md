@@ -146,3 +146,10 @@ Limitations
 - **Evaluation gap**: Offline accuracy and EV on historical data are only proxies for live win‑rate; real‑world performance will depend on table dynamics and opponent adaptation.
 - **Ethical use**: This code is for research and educational purposes; many poker sites restrict or forbid real‑time assistance tools—check and follow the rules of any platform you use.
 
+Design Choices
+--------------
+
+- **Frozen policy backbone with online belief updates**: keeps the main decision network stable while beliefs adapt over time.
+- **Confidence-weighted opponent updates**: down-weights noisy, low-signal hands to reduce overfitting to variance.
+- **Explicit separation between environment state and agent beliefs**: makes it clear which information comes from the shared world vs. inferred opponent models, and how each influences decisions.
+
