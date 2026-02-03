@@ -18,6 +18,23 @@ The core project lives in the `pokervision_github/` folder and includes a simple
 - Run the live assistant (see Quickstart below), then open `http://localhost:8000`.
 - A demo GIF (`pokervision_github/assets/demo.gif`) in the project shows the assistant analysing hands and suggesting actions.
 
+Architecture
+------------
+
+![PokerVision architecture](pokervision_github/assets/architecture.png)
+
+High-level flow:
+
+- **Environment state** (hand, pot, position, cards)  
+  ↓  
+- **Opponent belief state** (persistent memory over tendencies)  
+  ↓  
+- **Policy network** (conditions on state + beliefs)  
+  ↓  
+- **Action recommendation** (bet / call / fold, with explanation)  
+  ↓  
+- **Observed opponent action** → **belief update loop** back into the opponent state
+
 Quickstart
 ----------
 
