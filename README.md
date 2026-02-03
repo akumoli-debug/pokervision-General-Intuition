@@ -35,6 +35,11 @@ High-level flow:
   ↓  
 - **Observed opponent action** → **belief update loop** back into the opponent state
 
+Why Poker?
+----------
+
+Poker provides a minimal, well-defined environment for studying multi-agent interaction under uncertainty. Agents have hidden state, partial observability, repeated interaction, and incentives to exploit systematic deviations—making it a useful testbed for behavioural world modeling without complex physics or perception.
+
 Quickstart
 ----------
 
