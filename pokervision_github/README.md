@@ -165,6 +165,45 @@ Parameters: 317,414
 
 ---
 
+## 🌍 World Model: Opponent Beliefs and Decision Conditioning
+
+### Belief state (what the agent represents)
+
+For each opponent, PokerVision maintains a persistent **belief state** that summarizes latent behavioural tendencies, such as:
+
+- Propensity to fold under pressure
+- Call-down frequency across streets
+- Aggression by position and stack depth
+
+This belief is encoded as a structured feature vector / embedding and treated as an approximation of the opponent’s internal policy.
+
+### Online belief update (how it learns from interaction)
+
+After each observed action, the belief state is **updated online** using fresh evidence from the current hand:
+
+- Action taken (fold / call / raise / overbet, etc.)
+- Context (street, position, SPR, pot size, prior aggression)
+- Outcome (showdown / fold-to-pressure, realised reward)
+
+Updates are incremental and confidence-weighted, so the agent refines opponent representations over repeated interaction while remaining robust to short-term variance and one-off bluffs.
+
+### Policy conditioning (how beliefs affect decisions)
+
+At decision time, the policy conditions jointly on:
+
+1. The **current environment state** (hand features, cards, pot, stacks), and  
+2. The **opponent belief state** (their inferred policy).
+
+The learned belief modulates action preferences—for example:
+
+- Applying more pressure versus inferred over-folders
+- Favouring thin value bets versus calling stations
+- Trapping and inducing bluffs versus highly aggressive opponents
+
+This turns PokerVision into an **opponent-aware world model**: instead of playing a fixed equilibrium strategy, it performs adaptive, opponent-specific planning conditioned on its beliefs about who it is playing.
+
+---
+
 ## 💡 Why This Beats GTO
 
 ### GTO Approach (55%)
