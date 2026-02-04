@@ -28,4 +28,4 @@ python scripts/enhanced_complete_parser.py
 python scripts/train_with_cards.py
 ```
 
-That's it! 🎰
+That's it! 
